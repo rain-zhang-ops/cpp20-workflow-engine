@@ -237,6 +237,11 @@ void WorkflowEngine::run()
 
     std::cout << "[WorkflowEngine] Starting DAG with " << n << " nodes\n";
 
+    // Clear any data left over from the previous run so nodes always start
+    // with a clean shared context.
+    // 清除上次运行遗留的数据，确保节点始终从干净的共享上下文开始。
+    execution_ctx_.clear();
+
     // Schedule root nodes (no dependencies)
     for (const NodeConfig& cfg : node_configs_) {
         if (cfg.dependencies.empty())
@@ -308,7 +313,7 @@ void WorkflowEngine::executeNode(const std::string& node_id)
     // the shared_ptr and the old .so stays alive until we release it here.
     auto node = plugin_mgr_.getNode();
     if (node) {
-        node->execute(node_id);
+        node->execute(execution_ctx_);
     } else {
         std::cerr << "[WorkflowEngine] Node '" << node_id
                   << "': no plugin loaded!\n";

@@ -21,6 +21,7 @@ add_executable(workflow-engine
     src/ThreadPool.cpp
     src/PluginManager.cpp
     src/WorkflowEngine.cpp
+    src/ExecutionContext.cpp
 )
 
 target_include_directories(workflow-engine PRIVATE include)
@@ -30,6 +31,11 @@ target_link_libraries(workflow-engine
         dl        # dlopen / dlsym / dlclose
         pthread   # std::jthread / std::thread internals
 )
+
+# Export all symbols from the main binary so that plugins loaded via dlopen
+# can resolve the extern "C" ctx_* functions that live in the main binary.
+# 导出主程序的所有符号，使通过 dlopen 加载的插件能够解析主程序中的 extern "C" ctx_* 函数。
+target_link_options(workflow-engine PRIVATE -rdynamic)
 
 # ---- example plugin shared library ------------------------------------------
 add_library(example_plugin SHARED plugins/example_plugin.cpp)

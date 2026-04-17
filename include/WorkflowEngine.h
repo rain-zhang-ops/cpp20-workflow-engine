@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ExecutionContext.h"
 #include "PluginManager.h"
 #include "ThreadPool.h"
 #include "WorkflowNode.h"
@@ -70,6 +71,13 @@ private:
 
     ThreadPool&    pool_;
     PluginManager& plugin_mgr_;
+
+    // Shared context for a single DAG run.  Created fresh in run() and
+    // passed by reference to every node's execute().
+    //
+    // 单次 DAG 运行的共享上下文。在 run() 中重新创建，
+    // 并以引用方式传递给每个节点的 execute()。
+    ExecutionContext execution_ctx_;
 
     std::vector<NodeConfig>                                   node_configs_;
     std::unordered_map<std::string, std::unique_ptr<NodeState>> node_states_;
