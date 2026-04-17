@@ -1,11 +1,16 @@
 #pragma once
 
+#include "AsyncLogger.h"
+#include "EngineMetrics.h"
 #include "ExecutionContext.h"
+#include "NodeState.h"
 #include "PluginManager.h"
+#include "ScopedTimer.h"
 #include "ThreadPool.h"
 #include "WorkflowNode.h"
 
 #include <atomic>
+#include <chrono>
 #include <latch>
 #include <memory>
 #include <string>
@@ -16,6 +21,7 @@
 struct NodeConfig {
     std::string              id;
     std::vector<std::string> dependencies;
+    int                      max_retries{0};  ///< Extra attempts on failure
 };
 
 /**
@@ -57,17 +63,34 @@ public:
      */
     void onConfigChanged(const std::string& json_path);
 
+    /**
+     * Return a reference to the engine-wide performance counters.
+     * Caller may read values at any time (all loads are atomic).
+     *
+     * 返回引擎全局性能计数器的常量引用，调用方可随时读取（所有读取均为原子）。
+     */
+    [[nodiscard]] const EngineMetrics& getMetrics() const noexcept {
+        return metrics_;
+    }
+
 private:
-    // Internal per-node runtime state
-    struct NodeState {
+    // Internal per-node runtime state (renamed from NodeState to avoid clash
+    // with the public NodeState enum class defined in NodeState.h).
+    struct NodeRuntimeState {
         std::string              id;
         std::vector<std::string> downstream;       // IDs of nodes that depend on this
         std::atomic<int>         uncompleted_deps{0};
-        std::atomic<uint8_t>     status{NodeReady};
+        std::atomic<NodeState>   node_state{NodeState::Pending};
+        int                      max_retries{0};
+        // Timestamp recorded when the node is enqueued — used to compute
+        // the queue-wait duration logged alongside the execution duration.
+        std::chrono::high_resolution_clock::time_point enqueue_time{};
     };
 
     void scheduleNode(const std::string& node_id);
     void executeNode(const std::string& node_id);
+    /** Atomically mark node (and all its transitive descendants) Cancelled. */
+    void cancelNodeAndDownstream(const std::string& node_id);
 
     ThreadPool&    pool_;
     PluginManager& plugin_mgr_;
@@ -79,9 +102,15 @@ private:
     // 并以引用方式传递给每个节点的 execute()。
     ExecutionContext execution_ctx_;
 
-    std::vector<NodeConfig>                                   node_configs_;
-    std::unordered_map<std::string, std::unique_ptr<NodeState>> node_states_;
+    std::vector<NodeConfig>                                             node_configs_;
+    std::unordered_map<std::string, std::unique_ptr<NodeRuntimeState>> node_states_;
 
-    std::string                plugin_so_path_;
+    std::string                 plugin_so_path_;
     std::unique_ptr<std::latch> completion_latch_;
+
+    // Observability — both owned by WorkflowEngine.
+    // AsyncLogger contains a std::jthread: declare it last so it is destroyed
+    // first (before node_states_ / completion_latch_ are torn down).
+    EngineMetrics metrics_;
+    AsyncLogger   logger_;
 };

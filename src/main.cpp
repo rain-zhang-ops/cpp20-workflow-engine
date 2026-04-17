@@ -66,6 +66,12 @@ int main(int argc, char* argv[])
     engine.run();
     engine.waitForCompletion();
 
+    // -----------------------------------------------------------------------
+    // 8. Print cumulative metrics across both runs
+    // -----------------------------------------------------------------------
+    std::cout << "\n[main] Cumulative metrics across all runs:\n";
+    engine.getMetrics().print();
+
     std::cout << "\n[main] Done.\n";
     // ConfigWatcher destructor stops the inotify thread gracefully.
     // ThreadPool destructor drains remaining tasks and joins workers.
