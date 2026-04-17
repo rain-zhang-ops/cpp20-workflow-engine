@@ -14,6 +14,55 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # ---- common compiler flags --------------------------------------------------
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# ============================================================================
+# Third-party dependencies via FetchContent
+# ============================================================================
+
+include(FetchContent)
+
+# ---- nlohmann/json ----------------------------------------------------------
+# Header-only JSON library used by GraphBuilder.
+# GraphBuilder 使用的纯头文件 JSON 库。
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+# Only build the header-only interface; skip tests and benchmarks.
+# 仅构建纯头文件接口，跳过测试和基准测试。
+set(JSON_BuildTests   OFF CACHE INTERNAL "")
+set(JSON_Install      OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)
+
+# ---- taskflow ---------------------------------------------------------------
+# Header-only task parallelism library used by GraphBuilder.
+# GraphBuilder 使用的纯头文件任务并行库。
+FetchContent_Declare(
+    taskflow
+    GIT_REPOSITORY https://github.com/taskflow/taskflow.git
+    GIT_TAG        v3.7.0
+    GIT_SHALLOW    TRUE
+)
+# Skip Taskflow's own examples and tests to keep build times short.
+# 跳过 Taskflow 自带的示例和测试，保持构建时间短暂。
+set(TF_BUILD_EXAMPLES OFF CACHE INTERNAL "")
+set(TF_BUILD_TESTS    OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(taskflow)
+
+# ============================================================================
+# Subdirectories
+# ============================================================================
+
+# core/ — ControlPlane, PluginRegistry, GraphBuilder static library
+add_subdirectory(core)
+
+# tools/ — workflow-cli CLI client
+add_subdirectory(tools)
+
+# examples/ — json_taskflow_demo
+add_subdirectory(examples)
+
 # ---- main executable --------------------------------------------------------
 add_executable(workflow-engine
     src/main.cpp
@@ -28,8 +77,9 @@ target_include_directories(workflow-engine PRIVATE include)
 
 target_link_libraries(workflow-engine
     PRIVATE
-        dl        # dlopen / dlsym / dlclose
-        pthread   # std::jthread / std::thread internals
+        workflow-core  # ControlPlane, PluginRegistry, GraphBuilder
+        dl             # dlopen / dlsym / dlclose
+        pthread        # std::jthread / std::thread internals
 )
 
 # Export all symbols from the main binary so that plugins loaded via dlopen
