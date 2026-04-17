@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
@@ -25,8 +26,6 @@ ConfigWatcher::ConfigWatcher(const std::string& path,
         throw std::runtime_error(
             std::string("inotify_init1 failed: ") + std::strerror(errno));
 
-    // Watch the *directory* that contains the file; inotify on a plain file
-    // misses events when editors write via a temp-file rename.
     auto dir = std::filesystem::path(path_).parent_path();
     if (dir.empty()) dir = ".";
 
@@ -47,13 +46,13 @@ ConfigWatcher::ConfigWatcher(const std::string& path,
     }
 
     // --- start background thread -----------------------------------------
-    // The stop_callback writes to event_fd so poll() wakes up immediately
-    // when request_stop() is called from the destructor.
     thread_ = std::jthread([this](std::stop_token st) {
         std::stop_callback sc{st, [this]() noexcept {
             const uint64_t val = 1;
-            // NOLINTNEXTLINE(bugprone-unused-return-value)
-            (void)write(event_fd_, &val, sizeof(val));
+            if (write(event_fd_, &val, sizeof(val)) < 0) {
+                std::cerr << "[ConfigWatcher] eventfd write error: "
+                          << std::strerror(errno) << "\n";
+            }
         }};
         watchLoop(st);
     });
@@ -65,12 +64,9 @@ ConfigWatcher::ConfigWatcher(const std::string& path,
 
 ConfigWatcher::~ConfigWatcher()
 {
-    // Stop the thread first (request_stop fires the stop_callback, writing to
-    // event_fd; join waits until the thread exits).
     thread_.request_stop();
     thread_.join();
 
-    // Now safe to close all descriptors.
     if (watch_fd_  >= 0) inotify_rm_watch(inotify_fd_, watch_fd_);
     if (inotify_fd_ >= 0) close(inotify_fd_);
     if (event_fd_  >= 0) close(event_fd_);
@@ -85,7 +81,6 @@ void ConfigWatcher::watchLoop(std::stop_token st)
     const auto filename =
         std::filesystem::path(path_).filename().string();
 
-    // Align storage for inotify_event + variable-length name field.
     alignas(inotify_event) char buf[4096];
 
     std::array<pollfd, 2> fds{};
@@ -95,17 +90,14 @@ void ConfigWatcher::watchLoop(std::stop_token st)
     fds[1].events = POLLIN;
 
     while (!st.stop_requested()) {
-        // Block here — 0% CPU when idle.
         const int ret = poll(fds.data(), fds.size(), -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        // Cancellation signal
         if (fds[1].revents & POLLIN) break;
 
-        // inotify event(s) available
         if (fds[0].revents & POLLIN) {
             const ssize_t len = read(inotify_fd_, buf, sizeof(buf));
             if (len < 0) continue;
