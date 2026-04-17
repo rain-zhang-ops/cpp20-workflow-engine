@@ -3,19 +3,23 @@
   "nodes": [
     {
       "id": "A",
-      "dependencies": []
+      "dependencies": [],
+      "max_retries": 2
     },
     {
       "id": "B",
-      "dependencies": ["A"]
+      "dependencies": ["A"],
+      "max_retries": 1
     },
     {
       "id": "C",
-      "dependencies": ["A"]
+      "dependencies": ["A"],
+      "max_retries": 0
     },
     {
       "id": "D",
-      "dependencies": ["B", "C"]
+      "dependencies": ["B", "C"],
+      "max_retries": 0
     }
   ]
 }

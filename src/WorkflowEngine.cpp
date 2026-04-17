@@ -1,4 +1,5 @@
 #include "WorkflowEngine.h"
+#include "NodeExecutionWrapper.h"
 
 #include <fstream>
 #include <iostream>
@@ -189,14 +190,20 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
                     cfg.dependencies.push_back(dep.str);
             }
         }
+
+        const JsonValue* retries_val = node_jv.get("max_retries");
+        if (retries_val && retries_val->type == JsonValue::Type::Number)
+            cfg.max_retries = static_cast<int>(retries_val->num);
+
         node_configs_.push_back(std::move(cfg));
     }
 
-    // --- build NodeState map --------------------------------------------------
+    // --- build NodeRuntimeState map ------------------------------------------
     node_states_.clear();
     for (const NodeConfig& cfg : node_configs_) {
-        auto state = std::make_unique<NodeState>();
-        state->id = cfg.id;
+        auto state = std::make_unique<NodeRuntimeState>();
+        state->id          = cfg.id;
+        state->max_retries = cfg.max_retries;
         node_states_[cfg.id] = std::move(state);
     }
 
@@ -228,13 +235,15 @@ void WorkflowEngine::run()
 
     // Reset per-run state
     for (const NodeConfig& cfg : node_configs_) {
-        NodeState& state = *node_states_[cfg.id];
+        NodeRuntimeState& state = *node_states_[cfg.id];
         state.uncompleted_deps.store(
             static_cast<int>(cfg.dependencies.size()),
             std::memory_order_relaxed);
-        state.status.store(NodeReady, std::memory_order_relaxed);
+        state.node_state.store(NodeState::Pending, std::memory_order_relaxed);
     }
 
+    logger_.info("[WorkflowEngine] Starting DAG with " +
+                 std::to_string(n) + " nodes");
     std::cout << "[WorkflowEngine] Starting DAG with " << n << " nodes\n";
 
     // Clear any data left over from the previous run so nodes always start
@@ -257,7 +266,12 @@ void WorkflowEngine::waitForCompletion()
 {
     if (completion_latch_)
         completion_latch_->wait();
+
+    // Flush async log output before printing the summary so all node-level
+    // log lines appear before the metrics line.
+    logger_.flush();
     std::cout << "[WorkflowEngine] DAG complete\n";
+    metrics_.print();
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +293,9 @@ void WorkflowEngine::onConfigChanged(const std::string& json_path)
         {
             plugin_so_path_ = plugin_val->str;
             plugin_mgr_.reload(plugin_so_path_);
+            metrics_.recordHotReload();
+            logger_.info("[WorkflowEngine] Hot-reloaded plugin: " +
+                         plugin_so_path_);
             std::cout << "[WorkflowEngine] Hot-reloaded plugin: "
                       << plugin_so_path_ << '\n';
         }
@@ -288,50 +305,124 @@ void WorkflowEngine::onConfigChanged(const std::string& json_path)
 }
 
 // ---------------------------------------------------------------------------
-// scheduleNode — push a ready node onto the thread pool
+// scheduleNode — record enqueue time and push onto the thread pool
 // ---------------------------------------------------------------------------
 
 void WorkflowEngine::scheduleNode(const std::string& node_id)
 {
-    NodeState& state = *node_states_[node_id];
-    state.status.store(NodeRunning, std::memory_order_relaxed);
+    NodeRuntimeState& state = *node_states_[node_id];
+
+    // Atomically transition Pending → Running.
+    // If the CAS fails the node was already Cancelled by cascade cancellation;
+    // in that case the latch was already counted down — do nothing.
+    NodeState expected = NodeState::Pending;
+    if (!state.node_state.compare_exchange_strong(
+            expected, NodeState::Running,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+        return;
+
+    state.enqueue_time = std::chrono::high_resolution_clock::now();
     pool_.enqueue([this, node_id]() { executeNode(node_id); });
 }
 
 // ---------------------------------------------------------------------------
-// executeNode — run the plugin, then trigger downstream nodes
+// executeNode — sandboxed execution with retries, timing, and cascade cancel
 // ---------------------------------------------------------------------------
 
 void WorkflowEngine::executeNode(const std::string& node_id)
 {
-    NodeState& state = *node_states_[node_id];
+    NodeRuntimeState& state = *node_states_[node_id];
 
+    // Measure queue-wait time (enqueue → start of actual execution).
+    auto queue_wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::high_resolution_clock::now() - state.enqueue_time).count();
+
+    logger_.info("[WorkflowEngine] Node '" + node_id +
+                 "' starting  queue_wait=" + std::to_string(queue_wait_ns) + "ns");
     std::cout << "[WorkflowEngine] Node '" << node_id << "' starting\n";
 
     // Atomically capture the current plugin instance.
     // If a hot-reload happens mid-execution, this node uses its own copy of
     // the shared_ptr and the old .so stays alive until we release it here.
     auto node = plugin_mgr_.getNode();
-    if (node) {
-        node->execute(execution_ctx_);
-    } else {
-        std::cerr << "[WorkflowEngine] Node '" << node_id
-                  << "': no plugin loaded!\n";
-        state.status.store(NodeFailed, std::memory_order_relaxed);
-        completion_latch_->count_down();
-        return;
-    }
 
-    state.status.store(NodeFinished, std::memory_order_relaxed);
-    std::cout << "[WorkflowEngine] Node '" << node_id << "' finished\n";
+    // Execute with timing.
+    // The ScopedTimer is scoped to just the wrapper.execute() call so that
+    // exec_ns is valid by the time we use it in the log messages below.
+    long long exec_ns = 0;
+    NodeResult result = makeNodeError(0, "not executed");
+    {
+        ScopedTimer exec_timer([&](ScopedTimer::Duration d) {
+            exec_ns = d.count();
+        });
+        NodeExecutionWrapper wrapper(node.get(), execution_ctx_,
+                                     state.max_retries);
+        result = wrapper.execute();
+    }  // exec_timer destructs here → exec_ns is now valid
+
+    if (nodeResultOk(result)) {
+        state.node_state.store(NodeState::Success,
+                               std::memory_order_release);
+        metrics_.recordSuccess();
+        logger_.info("[WorkflowEngine] Node '" + node_id +
+                     "' finished (Success)  exec=" + std::to_string(exec_ns) + "ns");
+        std::cout << "[WorkflowEngine] Node '" << node_id
+                  << "' finished\n";
+
+        completion_latch_->count_down();
+
+        // Decrement dependency counter of every downstream node; schedule
+        // those that become ready (counter reaches 0).
+        for (const std::string& ds_id : state.downstream) {
+            NodeRuntimeState& ds = *node_states_[ds_id];
+            if (ds.uncompleted_deps.fetch_sub(1,
+                    std::memory_order_acq_rel) == 1)
+                scheduleNode(ds_id);
+        }
+    } else {
+        const NodeError& err = nodeResultError(result);
+        state.node_state.store(NodeState::Failed,
+                               std::memory_order_release);
+        metrics_.recordFailure();
+        logger_.error("[WorkflowEngine] Node '" + node_id +
+                      "' failed: " + err.message +
+                      "  exec=" + std::to_string(exec_ns) + "ns");
+        std::cerr << "[WorkflowEngine] Node '" << node_id
+                  << "' failed: " << err.message << '\n';
+
+        completion_latch_->count_down();
+
+        // Fail-fast: cascade-cancel all transitive downstream nodes.
+        for (const std::string& ds_id : state.downstream)
+            cancelNodeAndDownstream(ds_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cancelNodeAndDownstream — atomically mark a node (and its descendants)
+//   as Cancelled and count it down in the latch.
+// ---------------------------------------------------------------------------
+
+void WorkflowEngine::cancelNodeAndDownstream(const std::string& node_id)
+{
+    NodeRuntimeState& state = *node_states_[node_id];
+
+    // Only transition from Pending; any other state means the node is already
+    // handled (Running/Success/Failed/Cancelled) — don't interfere.
+    NodeState expected = NodeState::Pending;
+    if (!state.node_state.compare_exchange_strong(
+            expected, NodeState::Cancelled,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+        return;
+
+    metrics_.recordCancelled();
+    logger_.warn("[WorkflowEngine] Node '" + node_id +
+                 "' cancelled (upstream failure)");
+    std::cout << "[WorkflowEngine] Node '" << node_id
+              << "' cancelled (upstream failure)\n";
 
     completion_latch_->count_down();
 
-    // Decrement dependency counter of every downstream node; schedule those
-    // that become ready (counter reaches 0).
-    for (const std::string& ds_id : state.downstream) {
-        NodeState& ds = *node_states_[ds_id];
-        if (ds.uncompleted_deps.fetch_sub(1, std::memory_order_acq_rel) == 1)
-            scheduleNode(ds_id);
-    }
+    for (const std::string& ds_id : state.downstream)
+        cancelNodeAndDownstream(ds_id);
 }
