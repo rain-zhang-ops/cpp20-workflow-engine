@@ -26,3 +26,6 @@ make -j$(nproc)
 ## 许可证
 
 MIT License
+
+
+git clone https://github.com/rain-zhang-ops/cpp20-workflow-engine.git && cd cpp20-workflow-engine/ && mkdir build && cd build && cmake .. && make -j 12
