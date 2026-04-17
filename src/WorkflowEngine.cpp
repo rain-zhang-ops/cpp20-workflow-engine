@@ -337,8 +337,8 @@ void WorkflowEngine::executeNode(const std::string& node_id)
     auto queue_wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now() - state.enqueue_time).count();
 
-    logger_.info("[WorkflowEngine] Node '" + node_id + "' starting"
-                 "  queue_wait=" + std::to_string(queue_wait_ns) + "ns");
+    logger_.info("[WorkflowEngine] Node '" + node_id +
+                 "' starting  queue_wait=" + std::to_string(queue_wait_ns) + "ns");
     std::cout << "[WorkflowEngine] Node '" << node_id << "' starting\n";
 
     // Atomically capture the current plugin instance.
@@ -365,8 +365,7 @@ void WorkflowEngine::executeNode(const std::string& node_id)
                                std::memory_order_release);
         metrics_.recordSuccess();
         logger_.info("[WorkflowEngine] Node '" + node_id +
-                     "' finished (Success)"
-                     "  exec=" + std::to_string(exec_ns) + "ns");
+                     "' finished (Success)  exec=" + std::to_string(exec_ns) + "ns");
         std::cout << "[WorkflowEngine] Node '" << node_id
                   << "' finished\n";
 
