@@ -1,0 +1,21 @@
+{
+  "plugin": "./libexample_plugin.so",
+  "nodes": [
+    {
+      "id": "A",
+      "dependencies": []
+    },
+    {
+      "id": "B",
+      "dependencies": ["A"]
+    },
+    {
+      "id": "C",
+      "dependencies": ["A"]
+    },
+    {
+      "id": "D",
+      "dependencies": ["B", "C"]
+    }
+  ]
+}
