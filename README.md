@@ -8,16 +8,55 @@
 
 ## 目录
 
+- [系统说明](#系统说明)
 - [系统架构](#系统架构)
 - [核心特性](#核心特性)
 - [目录结构](#目录结构)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
-- [CLI 控制台使用](#cli-控制台使用)
+- [CLI 控制台](#cli-控制台)
 - [插件开发指南](#插件开发指南)
 - [集成指南](#集成指南)
 - [技术栈](#技术栈)
 - [许可证](#许可证)
+
+---
+
+## 系统说明
+
+### 这是什么？
+
+cpp20-workflow-engine 是一个用纯 C++20 编写的 **DAG（有向无环图）工作流调度引擎**。它将一组有依赖关系的任务节点（插件 `.so`）按拓扑顺序自动并发执行，并提供运行时热重载、CLI 远程控制和全链路指标监控。
+
+### 解决什么问题？
+
+在 AI 推理、数据处理、DevOps 编排等场景中，往往需要：
+
+1. **多步骤任务编排** — 模型预处理 → 推理 → 后处理 → 写入，步骤间有依赖
+2. **高性能并发** — 无依赖的步骤必须并行，CPU 利用率要高
+3. **运行时灵活性** — 不停机修改工作流、替换算法插件
+4. **极低资源占用** — 无 JVM/Python 运行时开销，适合边缘设备和容器环境
+
+本引擎用 **原子操作 + 无锁数据结构** 实现 DAG 调度，用 **inotify + dlopen** 实现零停机热更新，用 **Unix Domain Socket** 实现进程外控制，整体内存占用通常 < 10 MB。
+
+### 典型使用场景
+
+| 场景 | 如何使用 |
+|------|---------|
+| **AI 推理流水线** | 每个节点是一个推理步骤（预处理/模型调用/后处理），插件 .so 封装具体逻辑 |
+| **数据 ETL** | 节点按 DAG 依赖并发执行 Extract → Transform → Load |
+| **CI/CD 任务编排** | 定义构建/测试/部署步骤的依赖关系，引擎自动调度 |
+| **IoT 边缘计算** | 极低资源占用，在嵌入式 Linux 设备上运行复杂工作流 |
+
+### 工作流程概览
+
+```
+1. 编写 workflow.json 定义节点和依赖关系
+2. 编写插件 .so（继承 WorkflowNode，实现 execute()）
+3. 启动引擎：./workflow-engine workflow.json
+4. 引擎自动：解析 JSON → 构建 DAG → 加载插件 → 并发调度执行
+5. 运行时：CLI 查状态 / 热重载配置 / 替换插件 / 优雅停机
+```
 
 ---
 
@@ -55,9 +94,10 @@
 ### 数据流
 
 1. `main.cpp` 启动 → ThreadPool → PluginManager → WorkflowEngine → ConfigWatcher → ControlPlane
-2. 引擎进入 **Daemon 模式**（`std::promise<void>().get_future().wait()`），主线程永久挂起
+2. 引擎以 **daemon 模式** 常驻运行
 3. 外部通过 `workflow-cli` 发送命令（RELOAD / STATUS / STOP）驱动引擎
 4. DAG 节点按依赖关系自动并行调度，原子计数器递减驱动下游节点
+5. 节点间通��� `ExecutionContext`（线程安全 KV 存储）共享数据
 
 ---
 
@@ -93,7 +133,7 @@ cpp20-workflow-engine/
 │   ├── WorkflowEngine.h        #   引擎头文件
 │   ├── ExecutionContext.h       #   共享上下文 + extern "C" API
 │   ├── ThreadPool.h            #   线程池
-│   ├── PluginManager.h         #   插���管理器
+│   ├── PluginManager.h         #   插件管理器
 │   ├── ConfigWatcher.h         #   配置监听器
 │   ├── NodeState.h             #   节点状态枚举
 │   ├── NodeExecutionWrapper.h  #   执行包装器（重试逻辑）
@@ -152,7 +192,7 @@ make -j$(nproc)
 ```bash
 cd build
 
-# 使用默认配置启动（daemon 模式，不会退出）
+# 使用默认配置启动（daemon 模式）
 ./workflow-engine
 
 # 或指定配置文件路径
@@ -166,16 +206,10 @@ cd build
 Config: ../config/workflow.json
 
 [main] ThreadPool created with 12 worker(s)
-[WorkflowEngine] Loaded config: ../config/workflow.json  plugin=./libexample_plugin.so  nodes=4
+[WorkflowEngine] Loaded config  plugin=./libexample_plugin.so  nodes=4
 [main] ConfigWatcher started for: ../config/workflow.json
-
 [main] ControlPlane started (socket: /tmp/workflow.sock)
-
-[main] Engine is running in daemon mode. Waiting for CLI commands via socket...
-[ControlPlane] Listening on /tmp/workflow.sock
 ```
-
-引擎以 **daemon 模式** 常驻运行，通过 CLI 或修改配置文件控制。
 
 ---
 
@@ -215,72 +249,60 @@ Config: ../config/workflow.json
 |------|------|------|
 | `plugin` | string | 插件 `.so` 文件路径（相对于 build 目录） |
 | `nodes` | array | DAG 节点列表 |
-| `nodes[].id` | string | 节点唯一标识 |
+| `nodes[].id` | string | 节点��一标识 |
 | `nodes[].dependencies` | string[] | 依赖的上游节点 ID 列表（空数组 = 根节点） |
 | `nodes[].max_retries` | number | 失败重试次数（0 = 不重试） |
 
 ### DAG 依赖图示例
 
-上述配置生成的 DAG：
-
 ```
-    A
+    A           ← 根节点，无依赖，最先执行
    / \
-  B   C
-   \ /
-    D
+  B   C         ← 依赖 A，A 完成后并行执行
+   \ /\n    D           ← 依赖 B 和 C，两者都完成后执行
 ```
-
-- A 为根节点，无依赖，最先执行
-- B 和 C 依赖 A，A 完成后并行执行
-- D 依赖 B 和 C，两者都完成后执行
 
 ### 热重载
 
-修改 `workflow.json` 并保存，ConfigWatcher 会自动检测变更并触发热重载。也可通过 CLI 手动触发：
-
 ```bash
+# 方式一：编辑配置文件，保存即触发（inotify 自动检测）
+vim config/workflow.json
+
+# 方式二：CLI 手动触发
 ./workflow-cli reload
 ```
 
 ---
 
-## CLI 控制台使用
+## CLI 控制台
 
 `workflow-cli` 通过 Unix Domain Socket (`/tmp/workflow.sock`) 与引擎通信。
 
-### 基本命令
+### 命令
 
 ```bash
 # 查看引擎运行状态
 ./workflow-cli status
-
-# 输出示例：
 # STATUS: workflow-engine running
-#   success_count    : 4
+#   success_count    : 8
 #   failed_count     : 0
 #   cancelled_count  : 0
-#   hot_reload_count : 0
+#   hot_reload_count : 1
 
 # 触发配置热重载
 ./workflow-cli reload
-
-# 输出示例：
 # OK: reloaded config from ../config/workflow.json
 
 # 优雅停止引擎
 ./workflow-cli stop
-
-# 输出示例：
 # OK: stop signal sent — engine will exit shortly
 ```
 
-### CLI 工作原理
+也可以不用 CLI 工具，直接通过 socket 通信：
 
-1. `workflow-cli` 连接到 `/tmp/workflow.sock`
-2. 发送命令字符串（如 `STATUS`）
-3. ControlPlane 在引擎进程内接收、分发、执行
-4. 结果通过 socket 回传给 CLI 并打印
+```bash
+echo "STATUS" | socat - UNIX-CONNECT:/tmp/workflow.sock
+```
 
 ---
 
@@ -291,7 +313,7 @@ Config: ../config/workflow.json
 所有插件必须实现 `WorkflowNode` 抽象基类，并导出 C 工厂函数：
 
 ```cpp
-// 你的插件 .cpp 文件
+// plugins/my_plugin.cpp
 #include "ExecutionContext.h"
 #include "WorkflowNode.h"
 
@@ -327,11 +349,11 @@ extern "C" void destroy_node(WorkflowNode* node) {
 
 ### ABI 安全规则
 
-> **重要**: 插件 `.so` 与主程序是独立编译单元。直接调用 ExecutionContext 的 C++ 成员函数（`set/get/has/remove`）是**不安全**的，因为 `std::any` 的 typeinfo 和分配器地址可能不同。
+> **重要**: 插件 `.so` 与主程序是独立编译单元。直接调用 ExecutionContext 的 C++ 成员函数（`set/get/has/remove`）是**不安全**的，因为 `std::any` 的 typeinfo 和内存分配器地址可能跨 .so 边界不同。
 >
-> **必须**使用 `extern "C"` 辅助函数（`ctx_set_string`、`ctx_get_int64` 等）。这些函数在主程序��实现，通过 `-rdynamic` 链接选项导出。
+> **必须**使用 `extern "C"` 辅助函数（`ctx_set_string`、`ctx_get_int64` 等）。这些函数在主程序中实现，通过 `-rdynamic` 链接选项导出。
 
-### 可用的 extern "C" 上下文 API
+### extern "C" 上下文 API
 
 ```c
 // 写入
@@ -356,7 +378,6 @@ void ctx_remove_key(void* ctx, const char* key);
 在 `CMakeLists.txt` 中添加：
 
 ```cmake
-# 新插件
 add_library(my_plugin SHARED plugins/my_plugin.cpp)
 target_include_directories(my_plugin PRIVATE include)
 set_target_properties(my_plugin PROPERTIES
@@ -365,34 +386,47 @@ set_target_properties(my_plugin PROPERTIES
 )
 ```
 
-然后在 `workflow.json` 中指定：
+在 `workflow.json` 中指定：
 
 ```json
 {
   "plugin": "./libmy_plugin.so",
-  "nodes": [...]
+  "nodes": [...] 
 }
 ```
+
+### 插件生命周期
+
+```
+dlopen("libmy_plugin.so")
+    ↓
+dlsym("create_node") → 获取工厂函数
+    ↓
+create_node() → 创建 WorkflowNode 实例
+    ↓
+execute(ctx) ← 线程池并发调用（可能多次）
+    ↓
+destroy_node(ptr) → 释放实例
+    ↓
+dlclose() → 卸载 .so
+```
+
+**热更新**: 修改 .so 源码 → 重新编译 → `./workflow-cli reload` → PluginManager 通过 `atomic_store(shared_ptr)` 无锁切换新实例，旧实例引用释放后自动卸载。
 
 ---
 
 ## 集成指南
 
-### 作为独立守护进程运行
+### 方式一：作为独立守护进程
 
-最常见的使用方式——作为后台服务运行，通过 CLI 或 Socket 交互：
+最常见的方式——后台运行，通过 CLI 或 socket 交互：
 
 ```bash
-# 后台启动
 nohup ./workflow-engine ../config/workflow.json > engine.log 2>&1 &
-
-# 通过 CLI 控制
 ./workflow-cli status
-./workflow-cli reload
-./workflow-cli stop
 ```
 
-### 编写 systemd 服务
+### 方式二：systemd 服务
 
 ```ini
 # /etc/systemd/system/workflow-engine.service
@@ -416,14 +450,13 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now workflow-engine
-sudo systemctl status workflow-engine
 ```
 
-### 通过 Socket 编程集成
+### 方式三：Socket 编程集成
 
 任何语言都可以通过 Unix Domain Socket 与引擎通信：
 
-**Python 示例：**
+**Python:**
 
 ```python
 import socket
@@ -436,22 +469,20 @@ def send_command(cmd: str, socket_path: str = "/tmp/workflow.sock") -> str:
     sock.close()
     return response
 
-# 使用
 print(send_command("STATUS"))
 print(send_command("RELOAD"))
 ```
 
-**Bash 示例：**
+**Bash:**
 
 ```bash
 echo "STATUS" | socat - UNIX-CONNECT:/tmp/workflow.sock
 ```
 
-**Node.js 示例：**
+**Node.js:**
 
 ```javascript
 const net = require('net');
-
 const client = net.createConnection('/tmp/workflow.sock', () => {
     client.write('STATUS');
 });
@@ -461,20 +492,14 @@ client.on('data', (data) => {
 });
 ```
 
-### 嵌入到现有 C++ 项目
+### 方式四：嵌入到现有 C++ 项目
 
-如果需要将引擎嵌入到现有项目中，直接链接 `workflow-core` 静态库：
+直接链接 `workflow-core` 静态库：
 
 ```cmake
-# 你的项目 CMakeLists.txt
 add_subdirectory(path/to/cpp20-workflow-engine)
-
-target_link_libraries(your_app
-    PRIVATE
-        workflow-core
-        dl
-        pthread
-)
+target_link_libraries(your_app PRIVATE workflow-core dl pthread)
+target_link_options(your_app PRIVATE -rdynamic)
 ```
 
 ```cpp
@@ -482,18 +507,38 @@ target_link_libraries(your_app
 #include "PluginManager.h"
 #include "WorkflowEngine.h"
 
-// 创建引擎
 ThreadPool pool;
 PluginManager plugin_mgr;
 WorkflowEngine engine(pool, plugin_mgr);
 
-// 加载配置并执行
 engine.loadConfig("workflow.json");
 engine.run();
 engine.waitForCompletion();
-
-// 查看指标
 engine.getMetrics().print();
+```
+
+### 自定义命令扩展
+
+通过 `ControlPlane::register_command()` 注册自定义命令：
+
+```cpp
+ControlPlane control_plane;
+
+control_plane.register_command("HEALTH", []() -> std::string {
+    return "OK: engine is healthy";
+});
+
+control_plane.register_command("METRICS", [&engine]() -> std::string {
+    const auto& m = engine.getMetrics();
+    return "success=" + std::to_string(m.success_count.load()) +
+           " failed=" + std::to_string(m.failed_count.load());
+});
+```
+
+注册后即可通过 CLI 或 socket 调用：
+
+```bash
+echo "HEALTH" | socat - UNIX-CONNECT:/tmp/workflow.sock
 ```
 
 ---
@@ -502,7 +547,7 @@ engine.getMetrics().print();
 
 | 类别 | 技术 |
 |------|------|
-| **语言标准** | C++20 (`-std=c++20`) |
+| **语言标准** | C++20 ( `-std=c++20` ) |
 | **构建** | CMake 3.20+ |
 | **并发** | `std::jthread`, `std::stop_token`, `std::latch`, `counting_semaphore`, `std::atomic` |
 | **系统 API** | `inotify`, `eventfd`, `poll`, `dlopen/dlsym`, Unix Domain Socket |
