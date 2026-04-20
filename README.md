@@ -559,3 +559,155 @@ echo "HEALTH" | socat - UNIX-CONNECT:/tmp/workflow.sock
 ## 许可证
 
 MIT License
+---
+
+## 插件 5：LLM 文本分析插件 (LlmTextAnalyzerNode)
+
+**文件**: `plugins/llm_text_analyzer_plugin.cpp` → `libllm_text_analyzer_plugin.so`
+
+### 功能
+
+读取多个 TXT 文件，将内容发送给大模型 API（支持 OpenAI 兼容接口 / 阿里云通义千问 / 本地 Ollama），执行用户自定义的分析任务（摘要、分类、情感分析、关键词提取等），将分析结果写入输出文件。
+
+### 编译
+
+```bash
+sudo apt install libssl-dev
+cd build && make llm_text_analyzer_plugin
+```
+
+### 主要输入参数
+
+| Key | 必需 | 默认值 | 说明 |
+|-----|------|--------|------|
+| `llm_input_path` | ✅ | — | TXT 文件路径或目录 |
+| `llm_api_key` | ✅ | — | API Key |
+| `llm_output_dir` | ❌ | `./llm_output` | 输出目录 |
+| `llm_api_endpoint` | ❌ | `https://api.openai.com/v1/chat/completions` | LLM API 端点 |
+| `llm_model` | ❌ | `gpt-4o` | 模型名称 |
+| `llm_provider` | ❌ | `openai` | `openai` / `dashscope` / `ollama` |
+| `llm_task_type` | ❌ | `summary` | `summary` / `keywords` / `sentiment` / `classification` / `qa_extract` / `custom` |
+| `llm_output_format` | ❌ | `markdown` | `markdown` / `json` / `txt` |
+| `llm_parallel` | ❌ | `2` | 并行请求数 |
+| `llm_merge_output` | ❌ | `false` | 是否将所有结果合并为一份总报告 |
+
+### 使用示例
+
+```cpp
+ctx_set_string(ctx_ptr, "llm_input_path",  "/data/texts/");
+ctx_set_string(ctx_ptr, "llm_api_key",     "sk-xxxxxxxx");
+ctx_set_string(ctx_ptr, "llm_provider",    "openai");
+ctx_set_string(ctx_ptr, "llm_task_type",   "summary");
+ctx_set_string(ctx_ptr, "llm_merge_output","true");
+```
+
+输出结果在 `./llm_output/` 目录，合并报告为 `_merged_report.md`。
+
+---
+
+## 插件 6：LLM 驱动音频编辑插件 (LlmAudioEditorNode)
+
+**文件**: `plugins/llm_audio_editor_plugin.cpp` → `libllm_audio_editor_plugin.so`
+
+### 功能
+
+读取 LLM 分析结果文件（插件 5 的输出），解析其中的 JSON 编辑指令，通过 FFmpeg 对 WAV 音频执行切割、拼接、静音插入、片段删除、变速、淡入淡出、音量调整、归一化等操作。
+
+### 依赖
+
+```bash
+sudo apt install ffmpeg
+cd build && make llm_audio_editor_plugin
+```
+
+### 支持的编辑指令类型
+
+| 指令类型 | 说明 |
+|----------|------|
+| `cut` | 截取指定时间段 |
+| `merge` | 拼接多个音频（支持 crossfade） |
+| `silence` | 插入静音片段 |
+| `delete` | 删除指定片段 |
+| `speed` | 变速（支持链式 atempo） |
+| `fade` | 淡入淡出 |
+| `volume` | 音量调整 |
+| `normalize` | 响度归一化 |
+
+### 主要输入参数
+
+| Key | 必需 | 默认值 | 说明 |
+|-----|------|--------|------|
+| `aed_input_path` | ✅ | — | LLM 分析结果文件路径或目录 |
+| `aed_audio_dir` | ✅ | — | WAV 音频文件所在目录 |
+| `aed_output_dir` | ❌ | `./audio_edited` | 输出目录 |
+| `aed_dry_run` | ❌ | `false` | 试运行模式：只打印命令不执行 |
+| `aed_parallel` | ❌ | `2` | 并行 ffmpeg 进程数（文件级别） |
+| `aed_overwrite` | ❌ | `false` | 是否覆盖已有文件 |
+
+### 指令文件格式
+
+在 LLM 输出文件中嵌入以下 JSON 块（插件会自动识别 ` ```json ``` ` 代码块）：
+
+```json
+{
+  "edit_commands": [
+    {
+      "type": "cut",
+      "source": "interview.wav",
+      "start": 10.5,
+      "end": 45.2,
+      "output": "segment_intro.wav",
+      "description": "提取开场白"
+    },
+    {
+      "type": "merge",
+      "sources": ["segment_intro.wav", "segment_main.wav"],
+      "output": "final_cut.wav",
+      "transition": "crossfade",
+      "crossfade_duration": 0.5,
+      "description": "合并精华片段"
+    }
+  ]
+}
+```
+
+---
+
+## 完整 AI 流水线
+
+六个插件串联构建完整的内容处理流水线：
+
+```
+知乎爬虫           百度网盘下载        视频转音频
+ZhihuCrawler  ──▶  BaiduPanDownloader ──▶  VideoToWav
+     │                                        │
+     │                                        ▼
+     │                               语音识别 WavToText
+     │                                        │
+     └────────────────────────────────────────┤
+                                              ▼
+                                   LLM 文本分析 LlmTextAnalyzer
+                                              │
+                                              ▼
+                                   LLM 音频编辑 LlmAudioEditor
+                                              │
+                                              ▼
+                                       编辑后 WAV 文件
+```
+
+使用 `config/full_ai_pipeline.json` 运行完整六节点流水线：
+
+```bash
+./workflow-engine ../config/full_ai_pipeline.json
+```
+
+### 各插件共享库与依赖
+
+| 插件 | 共享库 | 系统依赖 |
+|------|--------|----------|
+| 知乎爬虫 | `libzhihu_crawler_plugin.so` | `libssl-dev` |
+| 百度网盘下载 | `libbaidupan_downloader_plugin.so` | `libssl-dev` |
+| 视频转音频 | `libvideo_to_wav_plugin.so` | `ffmpeg` |
+| 语音识别 | `libwav_to_text_plugin.so` | 阿里云 NLS SDK 或本地 ASR |
+| LLM 文本分析 | `libllm_text_analyzer_plugin.so` | `libssl-dev` |
+| LLM 音频编辑 | `libllm_audio_editor_plugin.so` | `ffmpeg` |

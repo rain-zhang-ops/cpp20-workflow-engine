@@ -1,0 +1,11 @@
+{
+  "plugin": "./libexample_plugin.so",
+  "nodes": [
+    { "id": "crawl_zhihu",      "dependencies": [],                  "max_retries": 2 },
+    { "id": "download_files",   "dependencies": ["crawl_zhihu"],     "max_retries": 2 },
+    { "id": "video_to_wav",     "dependencies": ["download_files"],  "max_retries": 1 },
+    { "id": "wav_to_text",      "dependencies": ["video_to_wav"],    "max_retries": 2 },
+    { "id": "llm_analyze",      "dependencies": ["wav_to_text"],     "max_retries": 2 },
+    { "id": "audio_edit",       "dependencies": ["llm_analyze"],     "max_retries": 1 }
+  ]
+}
