@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /**
@@ -124,9 +125,15 @@ private:
     void executeNode(const std::string& node_id);
     /** Atomically mark node (and all its transitive descendants) Cancelled. */
     void cancelNodeAndDownstream(const std::string& node_id);
+    /** Validate DAG: no duplicate IDs, no unknown deps, no cycles. */
+    void validateDAG() const;
 
     ThreadPool&    pool_;
     PluginRegistry& registry_;
+
+    // Prevent concurrent run() calls — set true at start of run(),
+    // cleared at end of waitForCompletion().
+    std::atomic<bool> running_{false};
 
     // Shared context for a single DAG run.  Created fresh in run() and
     // passed by reference to every node's execute().

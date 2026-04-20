@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -214,6 +215,9 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
     // --- build NodeRuntimeState map ------------------------------------------
     node_states_.clear();
     for (const NodeConfig& cfg : node_configs_) {
+        if (node_states_.count(cfg.id))
+            throw std::runtime_error(
+                "WorkflowEngine: duplicate node id '" + cfg.id + "'");
         auto state        = std::make_unique<NodeRuntimeState>();
         state->id         = cfg.id;
         state->type       = cfg.type;
@@ -222,13 +226,71 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
     }
 
     // populate downstream adjacency lists
+    // Validate dependency IDs first so we emit a clear error message
+    // (instead of the cryptic std::out_of_range thrown by map::at).
+    for (const NodeConfig& cfg : node_configs_) {
+        for (const std::string& dep : cfg.dependencies) {
+            if (!node_states_.count(dep))
+                throw std::runtime_error(
+                    "WorkflowEngine: node '" + cfg.id +
+                    "' references unknown dependency '" + dep + "'");
+        }
+    }
     for (const NodeConfig& cfg : node_configs_) {
         for (const std::string& dep : cfg.dependencies)
             node_states_.at(dep)->downstream.push_back(cfg.id);
     }
 
+    // Validate DAG topology: unknown deps and cycles.
+    validateDAG();
+
     std::cout << "[WorkflowEngine] Loaded config: " << json_path
               << "  nodes=" << node_configs_.size() << '\n';
+}
+
+// ---------------------------------------------------------------------------
+// validateDAG — check for unknown dependency references and cycles
+//
+// Called at the end of loadConfig() after the adjacency lists are built.
+// Throws std::runtime_error on the first problem found.
+// ---------------------------------------------------------------------------
+
+void WorkflowEngine::validateDAG() const
+{
+    // --- Kahn's algorithm: detect cycles ------------------------------------
+    // in_degree[id] starts as the number of declared dependencies.
+    std::unordered_map<std::string, int> in_degree;
+    for (const NodeConfig& cfg : node_configs_)
+        in_degree[cfg.id] = static_cast<int>(cfg.dependencies.size());
+
+    std::queue<std::string> q;
+    for (const auto& [id, deg] : in_degree)
+        if (deg == 0) q.push(id);
+
+    int visited = 0;
+    while (!q.empty()) {
+        std::string cur = q.front();
+        q.pop();
+        ++visited;
+
+        for (const std::string& ds_id : node_states_.at(cur)->downstream)
+            if (--in_degree[ds_id] == 0) q.push(ds_id);
+    }
+
+    if (visited != static_cast<int>(node_configs_.size())) {
+        std::ostringstream oss;
+        oss << "WorkflowEngine: cycle detected involving nodes: [";
+        bool first = true;
+        for (const auto& [id, deg] : in_degree) {
+            if (deg > 0) {
+                if (!first) oss << ", ";
+                oss << '\'' << id << '\'';
+                first = false;
+            }
+        }
+        oss << ']';
+        throw std::runtime_error(oss.str());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +301,13 @@ void WorkflowEngine::run()
 {
     if (node_configs_.empty())
         throw std::runtime_error("WorkflowEngine: no nodes loaded — call loadConfig first");
+
+    // Prevent concurrent runs — compare_exchange ensures only one succeeds.
+    bool expected = false;
+    if (!running_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+        throw std::runtime_error(
+            "WorkflowEngine: run() called while a previous run is still in progress");
 
     const int n = static_cast<int>(node_configs_.size());
     completion_latch_ = std::make_unique<std::latch>(n);
@@ -276,6 +345,9 @@ void WorkflowEngine::waitForCompletion()
 {
     if (completion_latch_)
         completion_latch_->wait();
+
+    // Allow the next run() to proceed.
+    running_.store(false, std::memory_order_release);
 
     // Flush async log output before printing the summary so all node-level
     // log lines appear before the metrics line.
@@ -423,30 +495,40 @@ void WorkflowEngine::executeNode(const std::string& node_id)
 }
 
 // ---------------------------------------------------------------------------
-// cancelNodeAndDownstream — atomically mark a node (and its descendants)
-//   as Cancelled and count it down in the latch.
+// cancelNodeAndDownstream — iteratively mark a node (and all transitive
+//   descendants) as Cancelled and count each down in the latch.
+//
+// Iterative (not recursive) to avoid stack overflow on deep DAGs.
 // ---------------------------------------------------------------------------
 
-void WorkflowEngine::cancelNodeAndDownstream(const std::string& node_id)
+void WorkflowEngine::cancelNodeAndDownstream(const std::string& start_id)
 {
-    NodeRuntimeState& state = *node_states_[node_id];
+    // Use an explicit stack to avoid unbounded recursion depth.
+    std::vector<std::string> stack;
+    stack.push_back(start_id);
 
-    // Only transition from Pending; any other state means the node is already
-    // handled (Running/Success/Failed/Cancelled) — don't interfere.
-    NodeState expected = NodeState::Pending;
-    if (!state.node_state.compare_exchange_strong(
-            expected, NodeState::Cancelled,
-            std::memory_order_acq_rel, std::memory_order_relaxed))
-        return;
+    while (!stack.empty()) {
+        std::string node_id = std::move(stack.back());
+        stack.pop_back();
 
-    metrics_.recordCancelled();
-    logger_.warn("[WorkflowEngine] Node '" + node_id +
-                 "' cancelled (upstream failure)");
-    std::cout << "[WorkflowEngine] Node '" << node_id
-              << "' cancelled (upstream failure)\n";
+        NodeRuntimeState& state = *node_states_[node_id];
 
-    completion_latch_->count_down();
+        // Only transition from Pending; skip if already handled.
+        NodeState expected = NodeState::Pending;
+        if (!state.node_state.compare_exchange_strong(
+                expected, NodeState::Cancelled,
+                std::memory_order_acq_rel, std::memory_order_relaxed))
+            continue;
 
-    for (const std::string& ds_id : state.downstream)
-        cancelNodeAndDownstream(ds_id);
+        metrics_.recordCancelled();
+        logger_.warn("[WorkflowEngine] Node '" + node_id +
+                     "' cancelled (upstream failure)");
+        std::cout << "[WorkflowEngine] Node '" << node_id
+                  << "' cancelled (upstream failure)\n";
+
+        completion_latch_->count_down();
+
+        for (const std::string& ds_id : state.downstream)
+            stack.push_back(ds_id);
+    }
 }
