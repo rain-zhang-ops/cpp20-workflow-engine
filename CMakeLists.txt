@@ -97,3 +97,20 @@ set_target_properties(example_plugin PROPERTIES
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
+
+# ---- llm text analyzer plugin ------------------------------------------------
+add_library(llm_text_analyzer_plugin SHARED plugins/llm_text_analyzer_plugin.cpp)
+target_include_directories(llm_text_analyzer_plugin PRIVATE include)
+target_link_libraries(llm_text_analyzer_plugin PRIVATE ssl crypto)
+set_target_properties(llm_text_analyzer_plugin PROPERTIES
+    CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF
+)
+
+# ---- llm audio editor plugin -------------------------------------------------
+add_library(llm_audio_editor_plugin SHARED plugins/llm_audio_editor_plugin.cpp)
+target_include_directories(llm_audio_editor_plugin PRIVATE include)
+set_target_properties(llm_audio_editor_plugin PROPERTIES
+    CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF
+)
