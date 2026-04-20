@@ -1,17 +1,22 @@
 #include "ControlPlane.h"
 
-// Linux-specific socket headers
-#include <poll.h>
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/read_until.hpp>
+#include <boost/asio/write.hpp>
+
+// POSIX headers for SO_RCVTIMEO on the accepted socket
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
+#include <cctype>
 #include <cstdlib>   // std::atexit
-#include <cstring>   // std::strerror, std::strcpy
+#include <cstring>   // std::strerror
 #include <iostream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 
 // ============================================================================
@@ -21,28 +26,34 @@
 ControlPlane* ControlPlane::instance_ = nullptr;
 
 // ============================================================================
-// FdGuard::reset — close the fd if open
-// ============================================================================
-
-void ControlPlane::FdGuard::reset() noexcept
-{
-    if (fd >= 0) {
-        ::close(fd);
-        fd = -1;
-    }
-}
-
-// ============================================================================
 // ControlPlane — constructor
 // ============================================================================
 
 ControlPlane::ControlPlane(std::string socket_path)
     : socket_path_(std::move(socket_path))
+    , ioc_()
+    , acceptor_(ioc_)
 {
     // Remove stale socket file from a previous run so bind() succeeds.
     ::unlink(socket_path_.c_str());
 
-    setup_socket();
+    Protocol::endpoint endpoint(socket_path_);
+
+    boost::system::error_code ec;
+    acceptor_.open(endpoint.protocol(), ec);
+    if (ec)
+        throw std::runtime_error("ControlPlane: acceptor open failed: " +
+                                 ec.message());
+
+    acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec);
+
+    acceptor_.bind(endpoint, ec);
+    if (ec)
+        throw std::runtime_error("ControlPlane: bind failed: " + ec.message());
+
+    acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec)
+        throw std::runtime_error("ControlPlane: listen failed: " + ec.message());
 
     // Register atexit handler for crash/abnormal-exit cleanup.
     instance_ = this;
@@ -55,12 +66,14 @@ ControlPlane::ControlPlane(std::string socket_path)
 
 ControlPlane::~ControlPlane()
 {
-    server_fd_.reset();
+    boost::system::error_code ec;
+    if (acceptor_.is_open())
+        acceptor_.close(ec);
+
     ::unlink(socket_path_.c_str());
 
-    if (instance_ == this) {
+    if (instance_ == this)
         instance_ = nullptr;
-    }
 }
 
 // ============================================================================
@@ -69,45 +82,8 @@ ControlPlane::~ControlPlane()
 
 void ControlPlane::atexit_handler() noexcept
 {
-    if (instance_) {
+    if (instance_)
         ::unlink(instance_->socket_path_.c_str());
-    }
-}
-
-// ============================================================================
-// setup_socket — create, configure, bind, and listen on the UDS socket
-// ============================================================================
-
-void ControlPlane::setup_socket()
-{
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        throw std::runtime_error(
-            std::string("ControlPlane: socket() failed: ") +
-            std::strerror(errno));
-    }
-    server_fd_ = FdGuard(fd);
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-
-    if (socket_path_.size() >= sizeof(addr.sun_path)) {
-        throw std::runtime_error(
-            "ControlPlane: socket path too long: " + socket_path_);
-    }
-    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
-        throw std::runtime_error(
-            std::string("ControlPlane: bind() failed: ") +
-            std::strerror(errno));
-    }
-
-    if (::listen(fd, 8) < 0) {
-        throw std::runtime_error(
-            std::string("ControlPlane: listen() failed: ") +
-            std::strerror(errno));
-    }
 }
 
 // ============================================================================
@@ -124,105 +100,96 @@ void ControlPlane::register_command(const std::string&          cmd,
 }
 
 // ============================================================================
-// write_all — helper to write all bytes, retrying on EINTR / partial writes
-// ============================================================================
-
-static void write_all(int fd, const char* data, std::size_t len) noexcept
-{
-    while (len > 0) {
-        ssize_t n = ::write(fd, data, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            std::cerr << "[ControlPlane] write error: "
-                      << std::strerror(errno) << "\n";
-            return;
-        }
-        data += n;
-        len  -= static_cast<std::size_t>(n);
-    }
-}
-
-// ============================================================================
-// start_control_plane — main event loop
+// start_control_plane — async event loop
+//
+// Registers a std::stop_callback that stops the io_context when the jthread's
+// stop token fires, then runs the async accept loop until stop is requested.
 // ============================================================================
 
 void ControlPlane::start_control_plane(std::stop_token st)
 {
-    constexpr int POLL_TIMEOUT_MS = 100;
-
     std::cout << "[ControlPlane] Listening on " << socket_path_ << "\n";
 
-    while (!st.stop_requested()) {
-        pollfd pfd{};
-        pfd.fd     = server_fd_.fd;
-        pfd.events = POLLIN;
+    // When the owning jthread requests stop, cancel the io_context so that
+    // the pending async_accept is aborted and ioc_.run() returns.
+    std::stop_callback stop_cb(st, [this]() noexcept {
+        ioc_.stop();
+    });
 
-        int rc = ::poll(&pfd, 1, POLL_TIMEOUT_MS);
-
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            std::cerr << "[ControlPlane] poll() error: "
-                      << std::strerror(errno) << "\n";
-            break;
-        }
-
-        if (rc == 0) continue;
-
-        if (!(pfd.revents & POLLIN)) continue;
-
-        int client_fd = ::accept4(server_fd_.fd, nullptr, nullptr,
-                                  SOCK_CLOEXEC | SOCK_NONBLOCK);
-        if (client_fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            std::cerr << "[ControlPlane] accept4() error: "
-                      << std::strerror(errno) << "\n";
-            continue;
-        }
-
-        handle_client(client_fd);
-        ::close(client_fd);
-    }
+    do_accept();
+    ioc_.run();  // blocks until ioc_.stop() is called
 
     std::cout << "[ControlPlane] Stopping — cleaning up " << socket_path_ << "\n";
-    server_fd_.reset();
+
+    boost::system::error_code ec;
+    if (acceptor_.is_open())
+        acceptor_.close(ec);
+
     ::unlink(socket_path_.c_str());
-    if (instance_ == this) instance_ = nullptr;
+    if (instance_ == this)
+        instance_ = nullptr;
 }
 
 // ============================================================================
-// handle_client — read command, dispatch, write response
+// do_accept — post a single async_accept; re-arms itself on success
 // ============================================================================
 
-void ControlPlane::handle_client(int client_fd) noexcept
+void ControlPlane::do_accept()
+{
+    acceptor_.async_accept(
+        [this](boost::system::error_code ec, Protocol::socket peer) {
+            if (ec) {
+                // operation_aborted is expected when ioc_.stop() is called.
+                if (ec != boost::asio::error::operation_aborted)
+                    std::cerr << "[ControlPlane] accept error: "
+                              << ec.message() << "\n";
+                return;
+            }
+
+            handle_session(std::move(peer));
+            do_accept();   // re-arm for the next connection
+        });
+}
+
+// ============================================================================
+// handle_session — synchronous command read and response write
+//
+// The accepted socket is switched to blocking mode so that a plain read_some()
+// call blocks until data arrives (or the SO_RCVTIMEO deadline fires).
+// ============================================================================
+
+void ControlPlane::handle_session(Protocol::socket sock) noexcept
 {
     try {
-        constexpr int CLIENT_TIMEOUT_MS = 3000;
-        pollfd pfd{};
-        pfd.fd     = client_fd;
-        pfd.events = POLLIN;
+        boost::system::error_code ec;
 
-        int rc = ::poll(&pfd, 1, CLIENT_TIMEOUT_MS);
-        if (rc <= 0) {
-            const char* msg = "ERROR: timeout waiting for command\n";
-            write_all(client_fd, msg, std::strlen(msg));
-            return;
-        }
+        // Switch to blocking mode for straightforward synchronous I/O.
+        sock.non_blocking(false, ec);
+        if (ec) return;
+
+        // Apply a 3-second receive deadline so a stalled client cannot block
+        // the control-plane thread indefinitely.
+        struct timeval tv{3, 0};
+        ::setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
+                     &tv, sizeof(tv));
 
         constexpr std::size_t MAX_CMD_LEN = 1024;
         char buf[MAX_CMD_LEN + 1]{};
-        ssize_t n = ::read(client_fd, buf, MAX_CMD_LEN);
 
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                const char* msg = "ERROR: no data\n";
-                write_all(client_fd, msg, std::strlen(msg));
-            }
+        std::size_t n = sock.read_some(boost::asio::buffer(buf, MAX_CMD_LEN), ec);
+
+        if (ec) {
+            const std::string_view msg = ec == boost::asio::error::timed_out
+                ? "ERROR: timeout waiting for command\n"
+                : "ERROR: failed to receive command\n";
+            boost::asio::write(sock, boost::asio::buffer(msg), ec);
             return;
         }
         if (n == 0) return;
 
-        std::string cmd(buf, static_cast<std::size_t>(n));
+        std::string cmd(buf, n);
 
+        // Trim leading and trailing whitespace.
         auto not_space = [](unsigned char c) { return !std::isspace(c); };
         cmd.erase(cmd.begin(),
                   std::find_if(cmd.begin(), cmd.end(), not_space));
@@ -230,26 +197,26 @@ void ControlPlane::handle_client(int client_fd) noexcept
                   cmd.end());
 
         if (cmd.empty()) {
-            const char* msg = "ERROR: empty command\n";
-            write_all(client_fd, msg, std::strlen(msg));
+            const std::string_view msg = "ERROR: empty command\n";
+            boost::asio::write(sock, boost::asio::buffer(msg), ec);
             return;
         }
 
         if (cmd.size() > 256) {
-            const char* msg = "ERROR: command too long\n";
-            write_all(client_fd, msg, std::strlen(msg));
+            const std::string_view msg = "ERROR: command too long\n";
+            boost::asio::write(sock, boost::asio::buffer(msg), ec);
             return;
         }
 
         std::string response = dispatch(cmd);
         response += '\n';
-
-        write_all(client_fd, response.data(), response.size());
+        boost::asio::write(sock, boost::asio::buffer(response), ec);
 
     } catch (const std::exception& e) {
-        std::cerr << "[ControlPlane] handle_client exception: " << e.what() << "\n";
+        std::cerr << "[ControlPlane] handle_session exception: "
+                  << e.what() << "\n";
     } catch (...) {
-        std::cerr << "[ControlPlane] handle_client: unknown exception\n";
+        std::cerr << "[ControlPlane] handle_session: unknown exception\n";
     }
 }
 
@@ -266,7 +233,7 @@ std::string ControlPlane::dispatch(const std::string& cmd)
     auto it = handlers_.find(key);
     if (it == handlers_.end()) {
         return "ERROR: unknown command '" + cmd +
-               ". Known commands: RELOAD, STOP, STATUS";
+               "'. Known commands: RELOAD, STOP, STATUS";
     }
 
     try {

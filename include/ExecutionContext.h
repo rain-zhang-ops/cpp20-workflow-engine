@@ -63,11 +63,11 @@
 // ============================================================================
 
 #include <any>
+#include <boost/container/flat_map.hpp>
 #include <cstdint>
 #include <optional>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
 
 class ExecutionContext {
 public:
@@ -137,7 +137,15 @@ private:
     // mutable 使 const 的 get() 方法也能获取共享锁。
     mutable std::shared_mutex mutex_;
 
-    std::unordered_map<std::string, std::any> data_;
+    // boost::container::flat_map stores key-value pairs in a contiguous sorted
+    // array.  For workflow contexts with O(10–100) keys the cache-friendly
+    // layout outperforms std::unordered_map despite O(log n) vs O(1) lookups,
+    // because sequential access patterns dominate.
+    //
+    // boost::container::flat_map 将键值对存储在连续排序数组中。
+    // 对于拥有 O(10–100) 个键的工作流上下文，连续内存布局在实践中优于
+    // std::unordered_map，因为顺序访问模式占主导，缓存命中率更高。
+    boost::container::flat_map<std::string, std::any> data_;
 };
 
 // ============================================================================

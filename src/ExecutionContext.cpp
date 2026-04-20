@@ -17,7 +17,7 @@ void ExecutionContext::set(const std::string& key, std::any value)
 bool ExecutionContext::has(const std::string& key) const
 {
     std::shared_lock lock(mutex_);
-    return data_.count(key) != 0;
+    return data_.find(key) != data_.end();
 }
 
 void ExecutionContext::remove(const std::string& key)

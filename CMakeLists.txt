@@ -15,6 +15,15 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # ============================================================================
+# Boost — networking (Asio), concurrency (thread_pool), and containers
+# ============================================================================
+# Boost.Asio is header-only; Boost.Container is header-only.
+# We link Boost::system (Asio error codes) and Boost::thread (thread_pool
+# internals).  All components share a single Boost include root.
+# ============================================================================
+find_package(Boost 1.74 REQUIRED COMPONENTS system thread)
+
+# ============================================================================
 # Third-party dependencies via FetchContent
 # ============================================================================
 
@@ -82,6 +91,8 @@ target_include_directories(workflow-engine PRIVATE include)
 target_link_libraries(workflow-engine
     PRIVATE
         workflow-core  # ControlPlane, PluginRegistry, GraphBuilder
+        Boost::system  # Boost.Asio error codes
+        Boost::thread  # boost::asio::thread_pool internals
         dl             # dlopen / dlsym / dlclose
         pthread        # std::jthread / std::thread internals
 )
