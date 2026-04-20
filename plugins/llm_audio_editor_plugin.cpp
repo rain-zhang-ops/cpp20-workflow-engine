@@ -596,7 +596,8 @@ static std::string executeEditCommand(
         }
 
         // Build concat list file / 构建拼接列表文件
-        std::string list_path = "/tmp/llm_aed_merge_" + std::to_string(getpid()) + ".txt";
+        std::string list_path = (fs::temp_directory_path() /
+            ("llm_aed_merge_" + std::to_string(getpid()) + ".txt")).string();
         {
             std::ofstream list_ofs(list_path, std::ios::trunc);
             if (!list_ofs) return "Cannot write concat list: " + list_path;
@@ -636,7 +637,8 @@ static std::string executeEditCommand(
                                 (channels == 2) ? "stereo" : "mono";
 
         // Generate silence WAV to tmp file
-        std::string silence_path = "/tmp/llm_aed_silence_" + std::to_string(getpid()) + ".wav";
+        std::string silence_path = (fs::temp_directory_path() /
+            ("llm_aed_silence_" + std::to_string(getpid()) + ".wav")).string();
         {
             std::vector<std::string> sil_args = {ffmpeg, "-y",
                 "-f", "lavfi",
@@ -654,7 +656,8 @@ static std::string executeEditCommand(
 
         // Build concat order based on position
         // 根据插入位置构建拼接顺序
-        std::string list_path = "/tmp/llm_aed_sil_list_" + std::to_string(getpid()) + ".txt";
+        std::string list_path = (fs::temp_directory_path() /
+            ("llm_aed_sil_list_" + std::to_string(getpid()) + ".txt")).string();
         {
             std::ofstream lf(list_path, std::ios::trunc);
             if (!lf) return "Cannot write silence list";
@@ -662,9 +665,10 @@ static std::string executeEditCommand(
                 lf << "file '" << silence_path << "'\n";
                 lf << "file '" << src << "'\n";
             } else {
-                // Insert at arbitrary position: cut src into two parts then concat
-                // For simplicity, append silence at the end when position > 0
-                // 简单实现：当 position > 0 时在末尾拼接
+                // Simplified: append silence at the end when position > 0.
+                // True mid-stream insertion would require splitting source into two parts.
+                // 简单实现：position > 0 时将静音追加到末尾。
+                // 精确插入需要将源文件分为两段后拼接。
                 lf << "file '" << src << "'\n";
                 lf << "file '" << silence_path << "'\n";
             }

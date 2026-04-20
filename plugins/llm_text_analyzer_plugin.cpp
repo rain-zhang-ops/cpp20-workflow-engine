@@ -143,7 +143,8 @@ public:
         // Handle optional port in host string
         // 处理主机字符串中的可选端口
         if (auto colon = host.find(':'); colon != std::string::npos) {
-            port = std::stoi(host.substr(colon + 1));
+            try { port = std::stoi(host.substr(colon + 1)); }
+            catch (...) { return {-1, "Invalid port number in URL: " + host}; }
             host = host.substr(0, colon);
         }
 
@@ -269,7 +270,8 @@ private:
         auto space1 = raw.find(' ');
         if (space1 != std::string::npos && space1 < line_end) {
             auto space2 = raw.find(' ', space1 + 1);
-            status = std::stoi(raw.substr(space1 + 1, space2 - space1 - 1));
+            try { status = std::stoi(raw.substr(space1 + 1, space2 - space1 - 1)); }
+            catch (...) { return {-1, "Invalid HTTP status code in response"}; }
         }
 
         // Find header/body separator / 查找头部/正文分隔符
@@ -440,9 +442,11 @@ static std::vector<std::string> splitText(const std::string& text, size_t max_ch
             end = para + 2;
         } else {
             // Try sentence boundary: . or 。
-            // 再尝试句子边界
+            // 再尝试句子边界：. 或中文句号 。(UTF-8: E3 80 82)
             auto sent = text.rfind('.', end);
-            auto sent_cn = text.rfind('\xe3', end); // 。 starts with 0xe3 in UTF-8
+            // Scan for the first byte (0xE3) of potential 。sequences; the full
+            // three-byte sequence is verified below before accepting the match.
+            auto sent_cn = text.rfind('\xe3', end);
             size_t best = std::string::npos;
             if (sent != std::string::npos && sent > start) best = sent + 1;
             if (sent_cn != std::string::npos && sent_cn > start &&
