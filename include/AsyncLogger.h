@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -132,8 +134,31 @@ private:
     }
 
     static std::string formatEvent(const LogEvent& ev) {
+        // Format as: "YYYY-MM-DD HH:MM:SS.mmm [LEVEL] message\n"
+        auto t = std::chrono::system_clock::to_time_t(ev.timestamp);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      ev.timestamp.time_since_epoch()) % 1000;
+
+        std::tm tm_val{};
+        ::localtime_r(&t, &tm_val);
+
+        char time_buf[24];
+        std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_val);
+
+        // Zero-pad milliseconds to three digits.
+        char ms_buf[8];
+        auto ms_val = static_cast<int>(ms.count());
+        ms_buf[0] = static_cast<char>('0' + ms_val / 100);
+        ms_buf[1] = static_cast<char>('0' + (ms_val % 100) / 10);
+        ms_buf[2] = static_cast<char>('0' + ms_val % 10);
+        ms_buf[3] = '\0';
+
         std::string line;
-        line.reserve(ev.message.size() + 10);
+        line.reserve(ev.message.size() + 32);
+        line += time_buf;
+        line += '.';
+        line += ms_buf;
+        line += ' ';
         line += '[';
         line += levelName(ev.level);
         line += "] ";

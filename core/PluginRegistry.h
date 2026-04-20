@@ -30,6 +30,7 @@
 
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -66,5 +67,6 @@ public:
     [[nodiscard]] bool has(const std::string& type) const noexcept;
 
 private:
+    mutable std::shared_mutex                            mutex_;
     std::unordered_map<std::string, FactoryFunc> factories_;
 };

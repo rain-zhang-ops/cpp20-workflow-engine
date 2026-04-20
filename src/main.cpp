@@ -9,6 +9,7 @@
 #include "ControlPlane.h"
 
 #include <atomic>
+#include <csignal>
 #include <future>
 #include <iostream>
 #include <string>
@@ -22,6 +23,21 @@ int main(int argc, char* argv[])
 
     std::cout << "=== cpp20-workflow-engine ===\n"
               << "Config: " << config_path << "\n\n";
+
+    // -----------------------------------------------------------------------
+    // 0. Signal handling — register SIGTERM/SIGINT for graceful shutdown
+    //
+    //    Both signals set g_shutdown_requested so the daemon loop exits cleanly.
+    //    SA_RESTART re-enters interrupted system calls automatically.
+    // -----------------------------------------------------------------------
+    static std::atomic<bool> g_shutdown_requested{false};
+
+    struct sigaction sa{};
+    sa.sa_handler = [](int) noexcept { g_shutdown_requested.store(true, std::memory_order_relaxed); };
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &sa, nullptr);
+    ::sigaction(SIGINT,  &sa, nullptr);
 
     // -----------------------------------------------------------------------
     // 1. Create the thread pool (hardware concurrency workers)
@@ -149,13 +165,14 @@ int main(int argc, char* argv[])
     std::cout << "[main] ControlPlane started (socket: /tmp/workflow.sock)\n\n";
 
     // -----------------------------------------------------------------------
-    // 8. Daemon mode — block main thread indefinitely
-    //    DAG execution is now triggered exclusively via CLI commands.
+    // 8. Daemon mode — block main thread until stop signal or CLI STOP command
     // -----------------------------------------------------------------------
     std::cout << "[main] Engine is running in daemon mode. "
                  "Waiting for CLI commands via socket...\n";
 
-    std::promise<void>().get_future().wait();
+    while (!g_shutdown_requested.load(std::memory_order_relaxed) &&
+           !engine_stop_requested.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // --- Graceful shutdown (reached only if promise is fulfilled) ----------
     control_thread.request_stop();

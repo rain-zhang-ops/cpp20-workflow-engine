@@ -63,6 +63,10 @@ add_subdirectory(tools)
 # examples/ — json_taskflow_demo
 add_subdirectory(examples)
 
+# tests/ — Google Test unit tests
+enable_testing()
+add_subdirectory(tests)
+
 # ---- main executable --------------------------------------------------------
 add_executable(workflow-engine
     src/main.cpp
