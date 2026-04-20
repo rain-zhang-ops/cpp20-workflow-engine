@@ -798,10 +798,7 @@ public:
                     all_segs += "=== 第" + std::to_string(i+1) + "段分析结果 ===\n";
                     all_segs += seg_results[i] + "\n\n";
                 }
-                std::string merge_tmpl =
-                    "以上是一篇长文档按段落分析的结果，请综合汇总为一份完整分析报告：\n\n{content}";
-                std::string old_tmpl = user_tmpl;
-                // Temporarily use merge template
+                // Use callLlm to merge all segment results into a single report
                 std::string merged = callLlm(all_segs, filename);
                 if (merged.empty()) merged = all_segs; // fallback
                 analysis_result = merged;
@@ -912,9 +909,6 @@ public:
                 all_results += oss.str() + "\n\n";
             }
             std::string merge_user = replaceAll(merge_prompt, "{all_results}", all_results);
-            // Direct LLM call for merge (using kSummaryPrompt style)
-            auto old_user_tmpl = user_tmpl;
-            // Override user_tmpl temporarily for the merge call
             std::string merge_result;
             {
                 // Build merge request directly

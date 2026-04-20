@@ -540,13 +540,6 @@ static std::string executeEditCommand(
         return overwrite ? std::vector<std::string>{"-y"} : std::vector<std::string>{"-n"};
     };
 
-    auto buildArgs [[maybe_unused]] = [&](std::vector<std::string> base) -> std::vector<std::string> {
-        // Insert -y/-n after ffmpeg
-        auto yf = yFlag();
-        base.insert(base.begin() + 1, yf.begin(), yf.end());
-        return base;
-    };
-
     if (cmd.type == "cut") {
         // ffmpeg -y -i src -ss start -to end -acodec pcm_s16le out
         std::string src = resolveSrc(cmd.source);
@@ -676,7 +669,7 @@ static std::string executeEditCommand(
                 lf << "file '" << silence_path << "'\n";
             }
         }
-        struct ListClean2 { std::string p; ~ListClean2() { unlink(p.c_str()); } } lc{list_path};
+        struct SilenceConcatClean { std::string p; ~SilenceConcatClean() { unlink(p.c_str()); } } lc{list_path};
 
         std::vector<std::string> args = {ffmpeg};
         for (auto& a : yFlag()) args.push_back(a);
