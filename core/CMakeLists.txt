@@ -33,4 +33,6 @@ target_link_libraries(workflow-core
     PUBLIC
         nlohmann_json::nlohmann_json
         Taskflow
+        Boost::system  # Boost.Asio (ControlPlane async I/O)
+        Boost::thread  # boost::asio::thread_pool internals
 )
