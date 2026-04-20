@@ -1,6 +1,5 @@
 {
-  "plugin": "./libllm_text_analyzer_plugin.so",
   "nodes": [
-    { "id": "analyze_texts", "dependencies": [], "max_retries": 2 }
+    { "id": "analyze_texts", "type": "LlmTextAnalyzer", "dependencies": [], "max_retries": 2 }
   ]
 }

@@ -145,12 +145,24 @@ static std::string readFile(const std::string& path) {
 // WorkflowEngine
 // ============================================================================
 
-WorkflowEngine::WorkflowEngine(ThreadPool& pool, PluginManager& plugin_mgr)
-    : pool_(pool), plugin_mgr_(plugin_mgr)
+WorkflowEngine::WorkflowEngine(ThreadPool& pool, PluginRegistry& registry)
+    : pool_(pool), registry_(registry)
 {}
 
 // ---------------------------------------------------------------------------
-// loadConfig — parse JSON, rebuild DAG, hot-load plugin
+// loadConfig — parse JSON, rebuild DAG
+//
+// Expected JSON format:
+//   {
+//     "nodes": [
+//       {"id": "A", "type": "MyNodeType", "dependencies": [],        "max_retries": 2},
+//       {"id": "B", "type": "OtherType",  "dependencies": ["A"],     "max_retries": 1},
+//       {"id": "C", "type": "MyNodeType", "dependencies": ["A", "B"]               }
+//     ]
+//   }
+//
+// All "type" values must already be registered in the PluginRegistry supplied
+// at construction.  Plugin loading is the caller's responsibility.
 // ---------------------------------------------------------------------------
 
 void WorkflowEngine::loadConfig(const std::string& json_path)
@@ -162,12 +174,6 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
     if (root.type != JsonValue::Type::Object)
         throw std::runtime_error("workflow.json: root must be a JSON object");
 
-    // --- plugin path ---------------------------------------------------------
-    const JsonValue* plugin_val = root.get("plugin");
-    if (!plugin_val || plugin_val->type != JsonValue::Type::String)
-        throw std::runtime_error("workflow.json: missing \"plugin\" string");
-    plugin_so_path_ = plugin_val->str;
-
     // --- nodes array ---------------------------------------------------------
     const JsonValue* nodes_val = root.get("nodes");
     if (!nodes_val || nodes_val->type != JsonValue::Type::Array)
@@ -178,10 +184,17 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
         if (node_jv.type != JsonValue::Type::Object) continue;
 
         NodeConfig cfg;
+
         const JsonValue* id_val = node_jv.get("id");
         if (!id_val || id_val->type != JsonValue::Type::String)
             throw std::runtime_error("workflow.json: node missing \"id\"");
         cfg.id = id_val->str;
+
+        const JsonValue* type_val = node_jv.get("type");
+        if (!type_val || type_val->type != JsonValue::Type::String)
+            throw std::runtime_error(
+                "workflow.json: node \"" + cfg.id + "\" missing \"type\"");
+        cfg.type = type_val->str;
 
         const JsonValue* deps_val = node_jv.get("dependencies");
         if (deps_val && deps_val->type == JsonValue::Type::Array) {
@@ -201,8 +214,9 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
     // --- build NodeRuntimeState map ------------------------------------------
     node_states_.clear();
     for (const NodeConfig& cfg : node_configs_) {
-        auto state = std::make_unique<NodeRuntimeState>();
-        state->id          = cfg.id;
+        auto state        = std::make_unique<NodeRuntimeState>();
+        state->id         = cfg.id;
+        state->type       = cfg.type;
         state->max_retries = cfg.max_retries;
         node_states_[cfg.id] = std::move(state);
     }
@@ -213,11 +227,7 @@ void WorkflowEngine::loadConfig(const std::string& json_path)
             node_states_.at(dep)->downstream.push_back(cfg.id);
     }
 
-    // --- load plugin ----------------------------------------------------------
-    plugin_mgr_.reload(plugin_so_path_);
-
     std::cout << "[WorkflowEngine] Loaded config: " << json_path
-              << "  plugin=" << plugin_so_path_
               << "  nodes=" << node_configs_.size() << '\n';
 }
 
@@ -276,29 +286,20 @@ void WorkflowEngine::waitForCompletion()
 
 // ---------------------------------------------------------------------------
 // onConfigChanged — hot-reload callback for ConfigWatcher
+//
+// Rebuilds the DAG topology from the updated JSON file.
+// Plugin hot-reload (PluginManager::reload) is the caller's responsibility
+// and should be performed before or after this call as needed.
 // ---------------------------------------------------------------------------
 
 void WorkflowEngine::onConfigChanged(const std::string& json_path)
 {
-    std::cout << "[WorkflowEngine] Config changed, reloading plugin...\n";
+    std::cout << "[WorkflowEngine] Config changed, rebuilding DAG...\n";
     try {
-        // Re-parse config to pick up any new plugin path.
-        const std::string text = readFile(json_path);
-        std::size_t pos = 0;
-        const JsonValue root = parseValue(text, pos);
-
-        const JsonValue* plugin_val = root.get("plugin");
-        if (plugin_val && plugin_val->type == JsonValue::Type::String &&
-            !plugin_val->str.empty())
-        {
-            plugin_so_path_ = plugin_val->str;
-            plugin_mgr_.reload(plugin_so_path_);
-            metrics_.recordHotReload();
-            logger_.info("[WorkflowEngine] Hot-reloaded plugin: " +
-                         plugin_so_path_);
-            std::cout << "[WorkflowEngine] Hot-reloaded plugin: "
-                      << plugin_so_path_ << '\n';
-        }
+        loadConfig(json_path);
+        metrics_.recordHotReload();
+        logger_.info("[WorkflowEngine] DAG rebuilt from: " + json_path);
+        std::cout << "[WorkflowEngine] DAG rebuilt from: " << json_path << '\n';
     } catch (const std::exception& e) {
         std::cerr << "[WorkflowEngine] onConfigChanged error: " << e.what() << '\n';
     }
@@ -341,10 +342,33 @@ void WorkflowEngine::executeNode(const std::string& node_id)
                  "' starting  queue_wait=" + std::to_string(queue_wait_ns) + "ns");
     std::cout << "[WorkflowEngine] Node '" << node_id << "' starting\n";
 
-    // Atomically capture the current plugin instance.
-    // If a hot-reload happens mid-execution, this node uses its own copy of
-    // the shared_ptr and the old .so stays alive until we release it here.
-    auto node = plugin_mgr_.getNode();
+    // Create a fresh node instance for this execution via the registry.
+    // Using the per-node type means different nodes in the same DAG can
+    // perform different operations.  For plugin-backed types the factory
+    // typically wraps PluginManager::getNode() via PluginNodeAdapter, which
+    // atomically captures the current shared_ptr — ensuring hot-reload safety:
+    // the old .so stays alive until this unique_ptr is released.
+    //
+    // 通过注册表为本次执行创建新的节点实例。
+    // 每节点独立 type 意味着同一 DAG 中的不同节点可执行不同操作。
+    // 对于插件类型，工厂通常通过 PluginNodeAdapter 包装 PluginManager::getNode()，
+    // 原子捕获当前 shared_ptr，确保热重载安全。
+    std::unique_ptr<WorkflowNode> node;
+    try {
+        node = registry_.create(state.type);
+    } catch (const std::exception& e) {
+        // Registry lookup failure — treat as node failure.
+        state.node_state.store(NodeState::Failed, std::memory_order_release);
+        metrics_.recordFailure();
+        logger_.error("[WorkflowEngine] Node '" + node_id +
+                      "' registry error: " + e.what());
+        std::cerr << "[WorkflowEngine] Node '" << node_id
+                  << "' registry error: " << e.what() << '\n';
+        completion_latch_->count_down();
+        for (const std::string& ds_id : state.downstream)
+            cancelNodeAndDownstream(ds_id);
+        return;
+    }
 
     // Execute with timing.
     // The ScopedTimer is scoped to just the wrapper.execute() call so that

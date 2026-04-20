@@ -1,23 +1,26 @@
 {
-  "plugin": "./libexample_plugin.so",
   "nodes": [
     {
       "id": "A",
+      "type": "ExampleNode",
       "dependencies": [],
       "max_retries": 2
     },
     {
       "id": "B",
+      "type": "ExampleNode",
       "dependencies": ["A"],
       "max_retries": 1
     },
     {
       "id": "C",
+      "type": "ExampleNode",
       "dependencies": ["A"],
       "max_retries": 0
     },
     {
       "id": "D",
+      "type": "ExampleNode",
       "dependencies": ["B", "C"],
       "max_retries": 0
     }

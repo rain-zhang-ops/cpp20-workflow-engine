@@ -1,5 +1,7 @@
 #include "ConfigWatcher.h"
 #include "PluginManager.h"
+#include "PluginNodeAdapter.h"
+#include "PluginRegistry.h"
 #include "ThreadPool.h"
 #include "WorkflowEngine.h"
 
@@ -29,17 +31,46 @@ int main(int argc, char* argv[])
               << std::thread::hardware_concurrency() << " worker(s)\n";
 
     // -----------------------------------------------------------------------
-    // 2. Create the plugin manager
+    // 2. Plugin registry — framework dispatch layer
+    //
+    //    The registry maps type names (e.g. "ExampleNode") to factory
+    //    functions.  WorkflowEngine uses this to create a node per execution
+    //    without knowing anything about .so loading or hot-reload.
+    //
+    //    This is the primary extension point: add new node types here by
+    //    registering additional factories before calling engine.loadConfig().
     // -----------------------------------------------------------------------
-    PluginManager plugin_mgr;
+    PluginRegistry registry;
 
     // -----------------------------------------------------------------------
-    // 3. Create the workflow engine (DAG scheduler)
+    // 3. Plugin manager — owns the dlopen lifecycle for the example plugin
+    //
+    //    PluginManager is intentionally kept outside WorkflowEngine so that:
+    //      a) The engine remains independent of any particular plugin set.
+    //      b) Hot-reload (pm.reload) is an application-level concern.
+    //      c) Multiple plugin managers can coexist for different node types.
     // -----------------------------------------------------------------------
-    WorkflowEngine engine(pool, plugin_mgr);
+    PluginManager example_pm;
+    const std::string example_so = "./libexample_plugin.so";
+    example_pm.reload(example_so);
+
+    // Register the "ExampleNode" type: each factory call creates an adapter
+    // that forwards execute() to the single shared node held by example_pm.
+    // When example_pm.reload() is called later the adapter picks up the new
+    // instance automatically (PluginManager::getNode() is atomic).
+    registry.register_node("ExampleNode", [&example_pm]() {
+        return std::make_unique<PluginNodeAdapter>(example_pm.getNode());
+    });
 
     // -----------------------------------------------------------------------
-    // 4. Load config (parses JSON, builds DAG, loads plugin via dlopen)
+    // 4. Create the workflow engine (DAG scheduler)
+    //    WorkflowEngine now depends only on ThreadPool and PluginRegistry —
+    //    no knowledge of .so files or hot-reload mechanisms.
+    // -----------------------------------------------------------------------
+    WorkflowEngine engine(pool, registry);
+
+    // -----------------------------------------------------------------------
+    // 5. Load config (parses JSON, builds DAG from per-node "type" fields)
     // -----------------------------------------------------------------------
     try {
         engine.loadConfig(config_path);
@@ -49,24 +80,42 @@ int main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // 5. Set up ConfigWatcher for hot-reload
+    // 6. Set up ConfigWatcher for hot-reload
+    //
+    //    The callback:
+    //      a) Hot-reloads the plugin .so (application responsibility).
+    //      b) Rebuilds the DAG topology from the updated JSON.
+    //    These two steps are independent and ordered: the new node instance
+    //    is available before the engine re-reads the graph structure.
     // -----------------------------------------------------------------------
-    ConfigWatcher watcher(config_path, [&engine, &config_path]() {
+    ConfigWatcher watcher(config_path, [&engine, &example_pm,
+                                        &example_so, &config_path]() {
+        // Reload the plugin first so the registry factory immediately serves
+        // the new instance once the engine starts scheduling nodes.
+        try {
+            example_pm.reload(example_so);
+            std::cout << "[main] Hot-reloaded plugin: " << example_so << '\n';
+        } catch (const std::exception& e) {
+            std::cerr << "[main] Plugin reload failed: " << e.what() << '\n';
+        }
+        // Rebuild the DAG from the updated config.
         engine.onConfigChanged(config_path);
     });
     std::cout << "[main] ConfigWatcher started for: " << config_path << "\n\n";
 
     // -----------------------------------------------------------------------
-    // 6. Control plane — UDS daemon for remote CLI control
+    // 7. Control plane — UDS daemon for remote CLI control
     // -----------------------------------------------------------------------
     std::atomic<bool> engine_stop_requested{false};
 
     ControlPlane control_plane;
 
-    control_plane.register_command("RELOAD", [&engine, &config_path]() -> std::string {
+    control_plane.register_command("RELOAD", [&engine, &example_pm,
+                                               &example_so, &config_path]() -> std::string {
         try {
+            example_pm.reload(example_so);
             engine.onConfigChanged(config_path);
-            return "OK: reloaded config from " + config_path;
+            return "OK: reloaded plugin and DAG from " + config_path;
         } catch (const std::exception& e) {
             return std::string("ERROR: reload failed: ") + e.what();
         }
@@ -100,7 +149,7 @@ int main(int argc, char* argv[])
     std::cout << "[main] ControlPlane started (socket: /tmp/workflow.sock)\n\n";
 
     // -----------------------------------------------------------------------
-    // 7. Daemon mode — block main thread indefinitely
+    // 8. Daemon mode — block main thread indefinitely
     //    DAG execution is now triggered exclusively via CLI commands.
     // -----------------------------------------------------------------------
     std::cout << "[main] Engine is running in daemon mode. "
