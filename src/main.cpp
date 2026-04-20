@@ -27,13 +27,18 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 0. Signal handling — register SIGTERM/SIGINT for graceful shutdown
     //
-    //    Both signals set g_shutdown_requested so the daemon loop exits cleanly.
-    //    SA_RESTART re-enters interrupted system calls automatically.
+    //    A static volatile sig_atomic_t flag is the only type guaranteed to
+    //    be async-signal-safe for signal handlers by the C++ standard.
+    //    The main loop polls it every 100 ms.
     // -----------------------------------------------------------------------
-    static std::atomic<bool> g_shutdown_requested{false};
+    static volatile sig_atomic_t g_shutdown_requested = 0;
+
+    struct SigHandler {
+        static void handle(int) noexcept { g_shutdown_requested = 1; }
+    };
 
     struct sigaction sa{};
-    sa.sa_handler = [](int) noexcept { g_shutdown_requested.store(true, std::memory_order_relaxed); };
+    sa.sa_handler = SigHandler::handle;
     ::sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     ::sigaction(SIGTERM, &sa, nullptr);
@@ -170,7 +175,7 @@ int main(int argc, char* argv[])
     std::cout << "[main] Engine is running in daemon mode. "
                  "Waiting for CLI commands via socket...\n";
 
-    while (!g_shutdown_requested.load(std::memory_order_relaxed) &&
+    while (!g_shutdown_requested &&
            !engine_stop_requested.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 

@@ -5,7 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <ctime>
 #include <functional>
 #include <iostream>
@@ -146,12 +146,9 @@ private:
         std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_val);
 
         // Zero-pad milliseconds to three digits.
-        char ms_buf[8];
         auto ms_val = static_cast<int>(ms.count());
-        ms_buf[0] = static_cast<char>('0' + ms_val / 100);
-        ms_buf[1] = static_cast<char>('0' + (ms_val % 100) / 10);
-        ms_buf[2] = static_cast<char>('0' + ms_val % 10);
-        ms_buf[3] = '\0';
+        char ms_buf[8];
+        std::snprintf(ms_buf, sizeof(ms_buf), "%03d", ms_val);
 
         std::string line;
         line.reserve(ev.message.size() + 32);
