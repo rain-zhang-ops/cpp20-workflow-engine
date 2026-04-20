@@ -1,6 +1,5 @@
 {
-  "plugin": "./libllm_audio_editor_plugin.so",
   "nodes": [
-    { "id": "edit_audio", "dependencies": [], "max_retries": 1 }
+    { "id": "edit_audio", "type": "LlmAudioEditor", "dependencies": [], "max_retries": 1 }
   ]
 }

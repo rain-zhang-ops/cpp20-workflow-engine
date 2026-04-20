@@ -1,11 +1,11 @@
 {
-  "plugin": "./libexample_plugin.so",
   "nodes": [
-    { "id": "crawl_zhihu",      "dependencies": [],                  "max_retries": 2 },
-    { "id": "download_files",   "dependencies": ["crawl_zhihu"],     "max_retries": 2 },
-    { "id": "video_to_wav",     "dependencies": ["download_files"],  "max_retries": 1 },
-    { "id": "wav_to_text",      "dependencies": ["video_to_wav"],    "max_retries": 2 },
-    { "id": "llm_analyze",      "dependencies": ["wav_to_text"],     "max_retries": 2 },
-    { "id": "audio_edit",       "dependencies": ["llm_analyze"],     "max_retries": 1 }
+    { "id": "crawl_zhihu",      "type": "ExampleNode", "dependencies": [],                  "max_retries": 2 },
+    { "id": "download_files",   "type": "ExampleNode", "dependencies": ["crawl_zhihu"],     "max_retries": 2 },
+    { "id": "video_to_wav",     "type": "ExampleNode", "dependencies": ["download_files"],  "max_retries": 1 },
+    { "id": "wav_to_text",      "type": "ExampleNode", "dependencies": ["video_to_wav"],    "max_retries": 2 },
+    { "id": "llm_analyze",      "type": "ExampleNode", "dependencies": ["wav_to_text"],     "max_retries": 2 },
+    { "id": "audio_edit",       "type": "ExampleNode", "dependencies": ["llm_analyze"],     "max_retries": 1 }
   ]
 }
+
