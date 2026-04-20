@@ -5,6 +5,9 @@
 #include "ThreadPool.h"
 #include "WorkflowEngine.h"
 
+// 主程序入口 — 组装引擎各组件并以守护进程模式运行 DAG 调度器
+// 职责：信号处理、插件注册、热重载配置、控制平面启动、优雅关闭
+
 // Control plane (UDS daemon thread)
 #include "ControlPlane.h"
 
@@ -27,9 +30,8 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 0. Signal handling — register SIGTERM/SIGINT for graceful shutdown
     //
-    //    A static volatile sig_atomic_t flag is the only type guaranteed to
-    //    be async-signal-safe for signal handlers by the C++ standard.
-    //    The main loop polls it every 100 ms.
+    //    sig_atomic_t 是信号处理函数中唯一保证 async-signal-safe 的类型。
+    //    主循环以 100ms 间隔轮询此标志，无需引入复杂的信号机制。
     // -----------------------------------------------------------------------
     static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -54,22 +56,19 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 2. Plugin registry — framework dispatch layer
     //
-    //    The registry maps type names (e.g. "ExampleNode") to factory
-    //    functions.  WorkflowEngine uses this to create a node per execution
-    //    without knowing anything about .so loading or hot-reload.
-    //
-    //    This is the primary extension point: add new node types here by
-    //    registering additional factories before calling engine.loadConfig().
+    //    注册表将类型名（如 "ExampleNode"）映射到工厂函数。
+    //    WorkflowEngine 通过类型名创建节点，与 .so 加载细节解耦。
+    //    扩展点：在 loadConfig() 前注册更多节点类型工厂。
     // -----------------------------------------------------------------------
     PluginRegistry registry;
 
     // -----------------------------------------------------------------------
     // 3. Plugin manager — owns the dlopen lifecycle for the example plugin
     //
-    //    PluginManager is intentionally kept outside WorkflowEngine so that:
-    //      a) The engine remains independent of any particular plugin set.
-    //      b) Hot-reload (pm.reload) is an application-level concern.
-    //      c) Multiple plugin managers can coexist for different node types.
+    //    PluginManager 故意置于 WorkflowEngine 之外：
+    //      a) 引擎保持对具体插件集无感知。
+    //      b) 热重载（pm.reload）是应用层关注点。
+    //      c) 多个 PluginManager 可并存，分别管理不同节点类型。
     // -----------------------------------------------------------------------
     PluginManager example_pm;
     const std::string example_so = "./libexample_plugin.so";
@@ -103,11 +102,8 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 6. Set up ConfigWatcher for hot-reload
     //
-    //    The callback:
-    //      a) Hot-reloads the plugin .so (application responsibility).
-    //      b) Rebuilds the DAG topology from the updated JSON.
-    //    These two steps are independent and ordered: the new node instance
-    //    is available before the engine re-reads the graph structure.
+    //    回调顺序：先 pm.reload() 替换节点实例，再 onConfigChanged() 重建 DAG。
+    //    这样在引擎调度新 DAG 时，注册表工厂已指向最新 .so 实例。
     // -----------------------------------------------------------------------
     ConfigWatcher watcher(config_path, [&engine, &example_pm,
                                         &example_so, &config_path]() {
@@ -171,6 +167,7 @@ int main(int argc, char* argv[])
 
     // -----------------------------------------------------------------------
     // 8. Daemon mode — block main thread until stop signal or CLI STOP command
+    // 100ms 轮询间隔：在信号/CLI 响应延迟与 CPU 占用之间取得平衡
     // -----------------------------------------------------------------------
     std::cout << "[main] Engine is running in daemon mode. "
                  "Waiting for CLI commands via socket...\n";

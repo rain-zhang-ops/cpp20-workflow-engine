@@ -1,5 +1,8 @@
 #include "ControlPlane.h"
 
+// ControlPlane 实现 — Boost.Asio 异步 UDS 服务器，stop_token 驱动优雅关闭
+// 关键设计：stop_callback 调用 ioc_.stop()，取消 async_accept 并使 ioc_.run() 返回
+
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/write.hpp>
@@ -34,7 +37,7 @@ ControlPlane::ControlPlane(std::string socket_path)
     , ioc_()
     , acceptor_(ioc_)
 {
-    // Remove stale socket file from a previous run so bind() succeeds.
+    // 先 unlink 旧 socket 文件，防止 bind() 因地址已占用而失败
     ::unlink(socket_path_.c_str());
 
     Protocol::endpoint endpoint(socket_path_);
@@ -55,7 +58,7 @@ ControlPlane::ControlPlane(std::string socket_path)
     if (ec)
         throw std::runtime_error("ControlPlane: listen failed: " + ec.message());
 
-    // Register atexit handler for crash/abnormal-exit cleanup.
+    // atexit：进程异常退出时仍能 unlink socket 文件，防止遗留僵尸 socket
     instance_ = this;
     std::atexit(ControlPlane::atexit_handler);
 }
@@ -88,6 +91,7 @@ void ControlPlane::atexit_handler() noexcept
 
 // ============================================================================
 // register_command
+// 命令关键字统一转为大写，保证 CLI 输入大小写不敏感
 // ============================================================================
 
 void ControlPlane::register_command(const std::string&          cmd,
@@ -110,8 +114,7 @@ void ControlPlane::start_control_plane(std::stop_token st)
 {
     std::cout << "[ControlPlane] Listening on " << socket_path_ << "\n";
 
-    // When the owning jthread requests stop, cancel the io_context so that
-    // the pending async_accept is aborted and ioc_.run() returns.
+    // stop_callback：stop_token 触发时停止 io_context，取消挂起的 async_accept
     std::stop_callback stop_cb(st, [this]() noexcept {
         ioc_.stop();
     });
@@ -132,6 +135,7 @@ void ControlPlane::start_control_plane(std::stop_token st)
 
 // ============================================================================
 // do_accept — post a single async_accept; re-arms itself on success
+// 每次成功 accept 后再次调用自身，形成持续监听循环（非递归，由 io_context 调度）
 // ============================================================================
 
 void ControlPlane::do_accept()
@@ -139,7 +143,7 @@ void ControlPlane::do_accept()
     acceptor_.async_accept(
         [this](boost::system::error_code ec, Protocol::socket peer) {
             if (ec) {
-                // operation_aborted is expected when ioc_.stop() is called.
+                // operation_aborted 是 ioc_.stop() 取消 async_accept 的正常结果，不报错
                 if (ec != boost::asio::error::operation_aborted)
                     std::cerr << "[ControlPlane] accept error: "
                               << ec.message() << "\n";
@@ -154,8 +158,7 @@ void ControlPlane::do_accept()
 // ============================================================================
 // handle_session — synchronous command read and response write
 //
-// The accepted socket is switched to blocking mode so that a plain read_some()
-// call blocks until data arrives (or the SO_RCVTIMEO deadline fires).
+// SO_RCVTIMEO 3 秒超时：防止滞留客户端长期阻塞控制平面线程
 // ============================================================================
 
 void ControlPlane::handle_session(Protocol::socket sock) noexcept
@@ -163,12 +166,11 @@ void ControlPlane::handle_session(Protocol::socket sock) noexcept
     try {
         boost::system::error_code ec;
 
-        // Switch to blocking mode for straightforward synchronous I/O.
+        // 切换为阻塞模式：控制平面处理命令为短交互，同步 I/O 更简单可靠
         sock.non_blocking(false, ec);
         if (ec) return;
 
-        // Apply a 3-second receive deadline so a stalled client cannot block
-        // the control-plane thread indefinitely.
+        // 3 秒接收超时：防止恶意/滞留客户端无限阻塞控制平面线程
         struct timeval tv{3, 0};
         ::setsockopt(sock.native_handle(), SOL_SOCKET, SO_RCVTIMEO,
                      &tv, sizeof(tv));

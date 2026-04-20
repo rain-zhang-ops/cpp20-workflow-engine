@@ -1,5 +1,8 @@
 #include "PluginRegistry.h"
 
+// PluginRegistry 实现 — 工厂注册表，shared_mutex 保护并发读写
+// create() 在锁外调用工厂函数，防止工厂内回调再次请求锁导致死锁
+
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -31,7 +34,8 @@ std::unique_ptr<WorkflowNode> PluginRegistry::create(const std::string& type) co
         }
         fn = it->second;
     }
-    // Invoke factory outside the lock — factory may call back into the engine.
+    // 锁外调用工厂函数：工厂可能触发 PluginManager::getNode()，
+    // 若在锁内调用且工厂内部再次访问 registry 则会死锁。
     return fn();
 }
 
