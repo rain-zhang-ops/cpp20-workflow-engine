@@ -28,8 +28,10 @@
  *
  * NOTE: member declaration order matters for destruction.
  *  stop_ is declared FIRST → destroyed LAST.
- *  pool_ is declared SECOND → destroyed FIRST (joins workers before stop_
- *  is torn down, keeping the check in enqueue() safe).
+ *  pool_ is declared SECOND → destroyed FIRST (pool_'s destructor joins the
+ *  worker threads; stop_ must still be alive at that point because the
+ *  destructor body sets stop_ = true before calling pool_.join(), and members
+ *  are destroyed in reverse declaration order after the destructor body).
  */
 class ThreadPool {
 public:

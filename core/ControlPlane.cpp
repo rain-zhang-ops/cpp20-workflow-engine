@@ -178,11 +178,14 @@ void ControlPlane::handle_session(Protocol::socket sock) noexcept
 
         std::size_t n = sock.read_some(boost::asio::buffer(buf, MAX_CMD_LEN), ec);
 
-        if (ec || n == 0) {
-            const std::string_view msg = "ERROR: timeout waiting for command\n";
+        if (ec) {
+            const std::string_view msg = ec == boost::asio::error::timed_out
+                ? "ERROR: timeout waiting for command\n"
+                : "ERROR: failed to receive command\n";
             boost::asio::write(sock, boost::asio::buffer(msg), ec);
             return;
         }
+        if (n == 0) return;
 
         std::string cmd(buf, n);
 
